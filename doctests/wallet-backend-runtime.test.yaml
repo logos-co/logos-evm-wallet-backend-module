@@ -1,0 +1,197 @@
+name: "Driving the Wallet Backend (4 modules) Against logoscore"
+output: wallet-backend-runtime.md
+release: ""
+
+intro: |
+  `logos-evm-wallet-backend-module` is the **coordinator** for the Logos
+  multi-chain EVM wallet. It depends on the eth-rpc, keystore, and token-list
+  modules and folds in the tx-builder, orchestrating the full send pipeline:
+  **build → sign → broadcast → record**.
+
+  This doc-test loads **all four** modules into a `logoscore` daemon and drives
+  the coordinator end-to-end against a **local mock JSON-RPC node** (offline,
+  reproducible): it configures a chain, imports a known account, and sends a
+  native transfer — watching the backend fetch the nonce/fees, build the tx, sign
+  it via the keystore, broadcast it via eth-rpc, and record it in local history.
+
+what_you_build: "All four wallet modules, installed with `lgpm` and driven through a `logoscore` daemon: the coordinator orchestrating a real send across its dependencies."
+
+what_you_learn:
+  - How a coordinator module declares and calls dependency modules over IPC
+  - How the central chain config is pushed down into the eth-rpc module
+  - How the send pipeline composes build (alloy) → sign (keystore) → broadcast (eth-rpc) → history
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled (see [nixos.org](https://nixos.org/download.html)).
+  - "**A Linux or macOS machine** with `python3` available (used to run the local mock JSON-RPC node)."
+
+sections:
+  - title: "Build logoscore and lgpm"
+    step: true
+    steps:
+      - title: "Build logoscore"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        check_file: "logos/bin/logoscore"
+      - title: "Build lgpm"
+        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
+        check_file: "lgpm/bin/lgpm"
+
+  - title: "Build and install all four modules"
+    step: true
+    text: |
+      The coordinator and its three dependency modules each build to an `.lgx`.
+      `logoscore`'s `load-module` does not auto-resolve dependencies, so we install
+      all four and load them explicitly below.
+    steps:
+      - title: "Build the four .lgx packages"
+        run: |
+          nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx'        --no-write-lock-file -o eth-rpc-lgx
+          nix build 'github:logos-co/logos-evm-keystore-module#lgx'       --no-write-lock-file -o keystore-lgx
+          nix build 'github:logos-co/logos-evm-token-list-module#lgx'     --no-write-lock-file -o token-list-lgx
+          nix build 'github:logos-co/logos-evm-wallet-backend-module#lgx' --no-write-lock-file -o backend-lgx
+        code_block: |
+          nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx'        -o eth-rpc-lgx
+          nix build 'github:logos-co/logos-evm-keystore-module#lgx'       -o keystore-lgx
+          nix build 'github:logos-co/logos-evm-token-list-module#lgx'     -o token-list-lgx
+          nix build 'github:logos-co/logos-evm-wallet-backend-module#lgx' -o backend-lgx
+      - title: "Seed the capability module"
+        run: |
+          mkdir -p modules
+          cp -RL ./logos/modules/. ./modules/
+        check_file: "modules/capability_module/manifest.json"
+      - title: "Install all four .lgx"
+        run: |
+          for p in eth-rpc-lgx keystore-lgx token-list-lgx backend-lgx; do
+            ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file "$p"/*.lgx
+          done
+        expect_contains:
+          - "Installed to:"
+      - title: "Confirm the installs"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules list"
+        expect_contains:
+          - "wallet_backend_module"
+          - "eth_rpc_module"
+          - "keystore_module"
+          - "token_list_module"
+
+  - title: "Start a mock JSON-RPC node"
+    step: true
+    steps:
+      - title: "Write the mock node"
+        text: "Answers the methods the send pipeline needs (chainId 1337) with canned values."
+        file:
+          path: mock_node.py
+          content: |
+            import http.server, json
+            RES = {
+                "eth_chainId": "0x539",                 # 1337
+                "eth_getTransactionCount": "0x0",
+                "eth_gasPrice": "0x3b9aca00",
+                "eth_estimateGas": "0x5208",
+                "eth_sendRawTransaction": "0x" + "ab" * 32,
+            }
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    n = int(self.headers.get('content-length', 0))
+                    req = json.loads(self.rfile.read(n) or b'{}')
+                    body = json.dumps({"jsonrpc": "2.0", "id": req.get("id", 1),
+                                       "result": RES.get(req.get("method"), "0x0")}).encode()
+                    self.send_response(200)
+                    self.send_header('content-length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('127.0.0.1', 8602), H).serve_forever()
+      - title: "Start the mock node"
+        run: "sh -c 'python3 mock_node.py > mock.log 2>&1 &'"
+        code_block: "python3 mock_node.py &"
+      - run: "sleep 2"
+
+  - title: "Run the daemon and drive the send pipeline"
+    step: true
+    steps:
+      - title: "Write the inputs"
+        file:
+          path: chains.json
+          content: |
+            [ { "chainId": 1337, "name": "Mock", "rpcUrl": "http://127.0.0.1:8602", "nativeSymbol": "ETH" } ]
+      - title: "Write the account import (Foundry's known test mnemonic)"
+        file:
+          path: mnemonic.json
+          content: |
+            { "phrase": "test test test test test test test test test test test junk", "accountIndex": 0, "password": "pw" }
+      - title: "Write the send request"
+        file:
+          path: send.json
+          content: |
+            {
+              "from": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+              "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+              "chainId": 1337,
+              "amount": "0xde0b6b3a7640000"
+            }
+      - title: "Start the daemon"
+        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
+        code_block: "logoscore -D -m ./modules > logs.txt &"
+      - run: "sleep 3"
+      - title: "Load all four modules"
+        run: |
+          for m in eth_rpc_module keystore_module token_list_module wallet_backend_module; do
+            ./logos/bin/logoscore load-module "$m"
+          done
+        code_block: |
+          for m in eth_rpc_module keystore_module token_list_module wallet_backend_module; do
+            logoscore load-module "$m"
+          done
+        expect_contains:
+          - "wallet_backend_module"
+      - title: "Configure the chain (pushed down into eth-rpc)"
+        run: "./logos/bin/logoscore call wallet_backend_module set_chains @chains.json"
+        code_block: "logoscore call wallet_backend_module set_chains @chains.json"
+        expect_contains:
+          - "true"
+      - title: "Test the endpoint (backend → eth-rpc → mock node)"
+        run: "./logos/bin/logoscore call wallet_backend_module test_endpoint 1337"
+        code_block: "logoscore call wallet_backend_module test_endpoint 1337"
+        expect_contains:
+          - "chainId"
+      - title: "Import a known account (backend → keystore)"
+        run: "./logos/bin/logoscore call wallet_backend_module import_mnemonic @mnemonic.json main"
+        code_block: "logoscore call wallet_backend_module import_mnemonic @mnemonic.json main"
+        expect_contains:
+          - "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+      - title: "List accounts"
+        run: "./logos/bin/logoscore call wallet_backend_module list_accounts"
+        expect_contains:
+          - "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+      - title: "Unlock the account"
+        run: "./logos/bin/logoscore call wallet_backend_module unlock f39fd6e51aad88f6f4ce6ab8827279cfffb92266 pw"
+        code_block: "logoscore call wallet_backend_module unlock <address> pw"
+        expect_contains:
+          - "true"
+      - title: "Send a native transfer (build → sign → broadcast → record)"
+        text: |
+          The coordinator fetches the nonce and gas price from eth-rpc, estimates
+          gas, builds the unsigned EIP-1559 tx (alloy), signs it via the keystore,
+          broadcasts it via eth-rpc (the mock returns a fixed hash), and records it.
+        run: "./logos/bin/logoscore call wallet_backend_module send_native @send.json"
+        code_block: "logoscore call wallet_backend_module send_native @send.json"
+        expect_contains:
+          - "hash"
+          - "abababab"
+      - title: "The transaction is in local history"
+        run: "./logos/bin/logoscore call wallet_backend_module get_history f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        code_block: "logoscore call wallet_backend_module get_history <address>"
+        expect_contains:
+          - "abababab"
+          - "pending"
+      - title: "Stop the daemon and the mock node"
+        run: |
+          ./logos/bin/logoscore stop
+          pkill -f mock_node.py 2>/dev/null || true
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logoscore status || true"
+        expect_contains:
+          - '"status":"not_running"'
