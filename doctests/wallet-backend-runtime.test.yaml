@@ -49,12 +49,12 @@ sections:
           nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx'        --no-write-lock-file -o eth-rpc-lgx
           nix build 'github:logos-co/logos-evm-keystore-module#lgx'       --no-write-lock-file -o keystore-lgx
           nix build 'github:logos-co/logos-evm-token-list-module#lgx'     --no-write-lock-file -o token-list-lgx
-          nix build 'github:logos-co/logos-evm-wallet-backend-module#lgx' --no-write-lock-file -o backend-lgx
+          nix build 'github:logos-co/logos-evm-wallet-backend-module{release}#lgx' --no-write-lock-file -o backend-lgx
         code_block: |
           nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx'        -o eth-rpc-lgx
           nix build 'github:logos-co/logos-evm-keystore-module#lgx'       -o keystore-lgx
           nix build 'github:logos-co/logos-evm-token-list-module#lgx'     -o token-list-lgx
-          nix build 'github:logos-co/logos-evm-wallet-backend-module#lgx' -o backend-lgx
+          nix build 'github:logos-co/logos-evm-wallet-backend-module{release}#lgx' -o backend-lgx
       - title: "Seed the capability module"
         run: |
           mkdir -p modules
