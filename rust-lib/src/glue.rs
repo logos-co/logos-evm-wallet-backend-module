@@ -46,6 +46,9 @@ pub trait WalletBackendModule: Send + 'static {
     fn refresh_balances(&mut self, address: String) -> bool;
     fn get_balances(&mut self, address: String) -> String;
 
+    // ── market (Uniswap prices for held tokens) ──
+    fn get_market(&mut self, address: String) -> String;
+
     // ── send ──
     fn estimate_fee(&mut self, send_json: String) -> String;
     fn send_native(&mut self, send_json: String) -> String;
@@ -110,6 +113,23 @@ fn parse_hex_u64(s: &str) -> u64 {
     let t = s.trim();
     let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
     u64::from_str_radix(h, 16).unwrap_or(0)
+}
+
+/// `balance / 10^decimals * usd` as a display value (f64 is ample for UI).
+fn value_usd(balance: &str, decimals: u8, usd: Option<f64>) -> Option<f64> {
+    let usd = usd?;
+    let bal: f64 = parse_u256_str(balance).to_string().parse().unwrap_or(0.0);
+    Some(bal / 10f64.powi(decimals as i32) * usd)
+}
+
+/// Fallback symbol for an unknown token: `0x1234…abcd`.
+fn short_addr(a: &str) -> String {
+    let t = a.trim_start_matches("0x");
+    if t.len() >= 8 {
+        format!("0x{}…{}", &t[..4], &t[t.len() - 4..])
+    } else {
+        a.to_string()
+    }
 }
 
 fn parse_u256_str(s: &str) -> U256 {
@@ -233,6 +253,130 @@ impl WalletBackendModuleImpl {
             token_balances.push(json!({ "address": t, "balance": bal.to_string() }));
         }
         Ok(json!({ "chainId": chain_id, "native": native.to_string(), "tokens": token_balances }))
+    }
+
+    /// Combine cached balances (tokens with balance > 0) with Uniswap prices for
+    /// the wallet's **Market** view. Per chain: pull held tokens from the cached
+    /// aggregate, look up symbol/decimals from `token_list`, ask `uniswap_module`
+    /// for token→ETH/USD prices (best-rate, one Multicall3 eth_call), and attach
+    /// a `valueUsd` to each holding (and to native ETH). Pricing failures degrade
+    /// gracefully to null prices — the holding still shows.
+    fn build_market(&mut self, address: &str) -> std::result::Result<Value, String> {
+        let cached = {
+            let st = self.st()?;
+            st.balances.get(address).cloned()
+        };
+        let Some(cached) = cached else {
+            return Ok(json!({ "ok": true, "address": address, "chains": [] }));
+        };
+        let empty = Vec::new();
+        let chains = cached.get("chains").and_then(Value::as_array).unwrap_or(&empty);
+
+        let mut chains_out = Vec::new();
+        for chain in chains {
+            let chain_id = chain.get("chainId").and_then(Value::as_u64).unwrap_or(0);
+            if chain_id == 0 {
+                continue;
+            }
+
+            // symbol/decimals lookup (lowercased address -> (symbol, decimals)).
+            let meta = self.token_meta(chain_id as i64);
+
+            // Held tokens (balance > 0) → the set we price.
+            let empty_toks = Vec::new();
+            let toks = chain.get("tokens").and_then(Value::as_array).unwrap_or(&empty_toks);
+            let mut held: Vec<(String, u8)> = Vec::new();
+            for t in toks {
+                let addr = t.get("address").and_then(Value::as_str).unwrap_or("");
+                let bal = t.get("balance").and_then(Value::as_str).unwrap_or("0");
+                if addr.is_empty() || parse_u256_str(bal).is_zero() {
+                    continue;
+                }
+                let dec = meta.get(&addr.to_lowercase()).map(|m| m.1).unwrap_or(18);
+                held.push((addr.to_string(), dec));
+            }
+
+            // Ask Uniswap for prices (held tokens; module adds stablecoins itself).
+            let prices = self.uniswap_prices(chain_id as i64, &held);
+
+            // Native ETH item.
+            let native_bal = chain.get("native").and_then(Value::as_str).unwrap_or("0");
+            let eth_usd = prices.get("ETH").and_then(|p| p.1);
+            let mut items = vec![json!({
+                "address": "native",
+                "symbol": "ETH",
+                "decimals": 18,
+                "balance": native_bal,
+                "eth": 1.0,
+                "usd": eth_usd,
+                "valueUsd": value_usd(native_bal, 18, eth_usd),
+            })];
+
+            for (addr, dec) in &held {
+                let (symbol, _) = meta.get(&addr.to_lowercase()).cloned().unwrap_or_else(|| (short_addr(addr), *dec));
+                let bal = toks
+                    .iter()
+                    .find(|t| t.get("address").and_then(Value::as_str) == Some(addr.as_str()))
+                    .and_then(|t| t.get("balance").and_then(Value::as_str))
+                    .unwrap_or("0");
+                let (eth, usd) = prices.get(addr.as_str()).copied().unwrap_or((None, None));
+                items.push(json!({
+                    "address": addr,
+                    "symbol": symbol,
+                    "decimals": dec,
+                    "balance": bal,
+                    "eth": eth,
+                    "usd": usd,
+                    "valueUsd": value_usd(bal, *dec, usd),
+                }));
+            }
+
+            chains_out.push(json!({ "chainId": chain_id, "items": items }));
+        }
+        Ok(json!({ "ok": true, "address": address, "chains": chains_out }))
+    }
+
+    /// `token_list.get_tokens(chainId)` → lowercased address -> (symbol, decimals).
+    fn token_meta(&mut self, chain_id: i64) -> std::collections::HashMap<String, (String, u8)> {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(s) = modules().token_list_module.get_tokens(chain_id) {
+            if let Ok(v) = serde_json::from_str::<Value>(&s) {
+                if let Some(arr) = v.get("tokens").and_then(Value::as_array) {
+                    for t in arr {
+                        if let Some(addr) = t.get("address").and_then(Value::as_str) {
+                            let sym = t.get("symbol").and_then(Value::as_str).unwrap_or("?").to_string();
+                            let dec = t.get("decimals").and_then(Value::as_u64).unwrap_or(18) as u8;
+                            map.insert(addr.to_lowercase(), (sym, dec));
+                        }
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    /// Ask `uniswap_module` for token→(eth, usd) prices, keyed by the address
+    /// string we passed (plus an `"ETH"` entry for native). Empty on failure.
+    fn uniswap_prices(&mut self, chain_id: i64, held: &[(String, u8)]) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
+        let mut out = std::collections::HashMap::new();
+        let tokens: Vec<Value> = held.iter().map(|(a, d)| json!({ "address": a, "decimals": d })).collect();
+        let req = json!({ "tokens": tokens }).to_string();
+        let resp = match modules().uniswap_module.get_prices(chain_id, &req) {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
+        if let Ok(v) = serde_json::from_str::<Value>(&resp) {
+            if let Some(arr) = v.get("prices").and_then(Value::as_array) {
+                for p in arr {
+                    if let Some(addr) = p.get("address").and_then(Value::as_str) {
+                        let eth = p.get("eth").and_then(Value::as_f64);
+                        let usd = p.get("usd").and_then(Value::as_f64);
+                        out.insert(addr.to_string(), (eth, usd));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Build → sign → broadcast → record. `erc20` carries (token, amount) when set.
@@ -468,6 +612,13 @@ impl WalletBackendModule for WalletBackendModuleImpl {
                 Some(v) => json!({ "ok": true, "balances": v }).to_string(),
                 None => json!({ "ok": true, "balances": { "address": address, "chains": [] } }).to_string(),
             },
+            Err(e) => err(e),
+        }
+    }
+
+    fn get_market(&mut self, address: String) -> String {
+        match self.build_market(&address) {
+            Ok(v) => v.to_string(),
             Err(e) => err(e),
         }
     }
