@@ -7,18 +7,19 @@
     # Dependency modules. Their published `.lidl` contracts drive the generated
     # `modules().<dep>` typed clients. The `follows` makes each dependency use the
     # SAME module-builder as this module (so `codegen.rust.source` is supported).
-    # Local paths here for in-workspace development; replaced with follows/URLs
-    # when registered in the workspace flake.
+    # In the workspace these resolve via `follows`/`--override-input` to the local
+    # checkouts; standalone they build once the dependency repos' default branches
+    # carry this code.
     eth_rpc_module = {
-      url = "path:/Users/dlipicar/repos/logos-workspace/repos/eth-rpc-module";
+      url = "github:logos-co/logos-evm-eth-rpc-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
     keystore_module = {
-      url = "path:/Users/dlipicar/repos/logos-workspace/repos/keystore-module";
+      url = "github:logos-co/logos-evm-keystore-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
     token_list_module = {
-      url = "path:/Users/dlipicar/repos/logos-workspace/repos/token-list-module";
+      url = "github:logos-co/logos-evm-token-list-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
   };
