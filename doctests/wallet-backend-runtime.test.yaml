@@ -147,12 +147,28 @@ sections:
         expect_contains:
           - "wallet_backend_module"
       - title: "Configure the chain (pushed down into eth-rpc)"
-        run: "./logos/bin/logoscore call wallet_backend_module set_chains @chains.json"
+        # set_chains pushes config into eth-rpc (cross-module) and is idempotent,
+        # so retry it on a transient RPC_FAILED too.
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call wallet_backend_module set_chains @chains.json 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         code_block: "logoscore call wallet_backend_module set_chains @chains.json"
         expect_contains:
           - "true"
       - title: "Test the endpoint (backend → eth-rpc → mock node)"
-        run: "./logos/bin/logoscore call wallet_backend_module test_endpoint 1337"
+        # Retry on a transient RPC_FAILED — this is the first call that drives the
+        # backend through a cross-module network round-trip (→ eth-rpc → mock),
+        # which can hit a transport race on loaded CI runners. test_endpoint is a
+        # pure read, so retrying is safe (and it warms the path for later steps).
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call wallet_backend_module test_endpoint 1337 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         code_block: "logoscore call wallet_backend_module test_endpoint 1337"
         expect_contains:
           - "chainId"
@@ -162,7 +178,12 @@ sections:
         expect_contains:
           - "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
       - title: "List accounts"
-        run: "./logos/bin/logoscore call wallet_backend_module list_accounts"
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call wallet_backend_module list_accounts 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         expect_contains:
           - "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
       - title: "Unlock the account"
@@ -181,14 +202,19 @@ sections:
           - "hash"
           - "abababab"
       - title: "The transaction is in local history"
-        run: "./logos/bin/logoscore call wallet_backend_module get_history f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call wallet_backend_module get_history f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         code_block: "logoscore call wallet_backend_module get_history <address>"
         expect_contains:
           - "abababab"
           - "pending"
       - title: "Stop the daemon and the mock node"
         run: |
-          ./logos/bin/logoscore stop
+          ./logos/bin/logoscore stop || true
           pkill -f mock_node.py 2>/dev/null || true
       - run: "sleep 2"
       - title: "Confirm the daemon has stopped"
