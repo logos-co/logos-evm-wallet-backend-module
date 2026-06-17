@@ -1,0 +1,29 @@
+[package]
+name = "wallet_backend_module"
+version = "1.0.0"
+edition = "2021"
+description = "Logos wallet backend — coordinator + tx builder. Multi-chain balances (Multicall3), send orchestration, local history."
+rust-version = "1.89"
+
+[workspace]
+resolver = "3"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Offline ABI encode/decode + tx field math. No network, no signing here — the
+# keystore signs, eth_rpc talks to the chain. `sol-types` brings the `sol!` macro.
+alloy = { version = "1", default-features = false, features = ["std", "sol-types"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
+
+[dev-dependencies]
+tempfile = "3"
