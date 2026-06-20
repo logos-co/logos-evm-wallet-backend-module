@@ -49,6 +49,10 @@ pub trait WalletBackendModule: Send + 'static {
 
     // ── market (Uniswap prices for held tokens) ──
     fn get_market(&mut self, address: String) -> String;
+    /// Refresh prices for held tokens across all chains concurrently (fans out one
+    /// `uniswap.get_prices` per chain), caches them, and emits `market_updated`.
+    /// `get_market` then reads the cache. Returns immediately.
+    fn refresh_market(&mut self, address: String) -> bool;
 
     // ── send ──
     fn estimate_fee(&mut self, send_json: String) -> String;
@@ -64,6 +68,7 @@ pub trait WalletBackendModule: Send + 'static {
 
 pub trait WalletBackendModuleEvents {
     fn balances_updated(&self, address: String);
+    fn market_updated(&self, address: String);
     fn tx_status_changed(&self, hash_hex: String);
     fn proxy_error(&self, context: String);
 }
@@ -86,6 +91,9 @@ struct State {
     /// (a `'static` closure that can't borrow `&self`) can write it; the event
     /// loop is single-threaded, so the lock is effectively uncontended.
     balances: Arc<Mutex<std::collections::HashMap<String, Value>>>,
+    /// chainId -> (token address -> (eth, usd)) prices — populated by the
+    /// `refresh_market` fan-out, read by `get_market`. Ephemeral (not persisted).
+    market_prices: Arc<Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>>>>,
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────
@@ -308,6 +316,25 @@ fn decode_call_balance_reply(reply: Option<String>) -> U256 {
         .unwrap_or(U256::ZERO)
 }
 
+/// Decode a uniswap `get_prices` reply (`{ prices: [{address, eth, usd}] }`) into
+/// a `token address -> (eth, usd)` map. Any failure yields an empty map.
+fn decode_uniswap_prices(reply: Option<String>) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
+    let mut out = std::collections::HashMap::new();
+    let Some(v) = reply.and_then(|s| serde_json::from_str::<Value>(&s).ok()) else {
+        return out;
+    };
+    if let Some(arr) = v.get("prices").and_then(Value::as_array) {
+        for p in arr {
+            if let Some(addr) = p.get("address").and_then(Value::as_str) {
+                let eth = p.get("eth").and_then(Value::as_f64);
+                let usd = p.get("usd").and_then(Value::as_f64);
+                out.insert(addr.to_string(), (eth, usd));
+            }
+        }
+    }
+    out
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendParams {
@@ -450,26 +477,13 @@ impl WalletBackendModuleImpl {
 
     /// Ask `uniswap_module` for token→(eth, usd) prices, keyed by the address
     /// string we passed (plus an `"ETH"` entry for native). Empty on failure.
-    fn uniswap_prices(&mut self, chain_id: i64, held: &[(String, u8)]) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
-        let mut out = std::collections::HashMap::new();
-        let tokens: Vec<Value> = held.iter().map(|(a, d)| json!({ "address": a, "decimals": d })).collect();
-        let req = json!({ "tokens": tokens }).to_string();
-        let resp = match modules().uniswap_module.get_prices(chain_id, &req) {
-            Ok(s) => s,
-            Err(_) => return out,
-        };
-        if let Ok(v) = serde_json::from_str::<Value>(&resp) {
-            if let Some(arr) = v.get("prices").and_then(Value::as_array) {
-                for p in arr {
-                    if let Some(addr) = p.get("address").and_then(Value::as_str) {
-                        let eth = p.get("eth").and_then(Value::as_f64);
-                        let usd = p.get("usd").and_then(Value::as_f64);
-                        out.insert(addr.to_string(), (eth, usd));
-                    }
-                }
-            }
-        }
-        out
+    /// Read the cached per-chain prices that `refresh_market` populated. `held` is
+    /// unused now — the cache already holds every priced token for the chain.
+    fn uniswap_prices(&mut self, chain_id: i64, _held: &[(String, u8)]) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
+        self.st()
+            .ok()
+            .and_then(|st| st.market_prices.lock().unwrap().get(&(chain_id as u64)).cloned())
+            .unwrap_or_default()
     }
 
     /// Build → sign → broadcast → record. `erc20` carries (token, amount) when set.
@@ -561,7 +575,8 @@ impl WalletBackendModule for WalletBackendModuleImpl {
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_default(),
         ));
-        let st = State { cfg, history, dir, watched, balances };
+        let market_prices = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let st = State { cfg, history, dir, watched, balances, market_prices };
         Self::push_chain_configs(&st);
         self.state = Some(st);
     }
@@ -728,6 +743,97 @@ impl WalletBackendModule for WalletBackendModuleImpl {
             }
             emit_balances_updated(&addr);
         });
+        true
+    }
+
+    fn refresh_market(&mut self, address: String) -> bool {
+        let cached = {
+            let st = match self.st() {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            st.balances.lock().unwrap().get(&address).cloned()
+        };
+        let Some(cached) = cached else {
+            // No balances yet — nothing to price; signal done so the UI doesn't wait.
+            emit_market_updated(&address);
+            return true;
+        };
+        // Pass 1: pull (chainId, tokens) from the cached aggregate (no &self borrow).
+        let chain_data: Vec<(u64, Vec<Value>)> = cached
+            .get("chains")
+            .and_then(Value::as_array)
+            .map(|chains| {
+                chains
+                    .iter()
+                    .filter_map(|c| {
+                        let id = c.get("chainId").and_then(Value::as_u64)?;
+                        if id == 0 {
+                            return None;
+                        }
+                        Some((id, c.get("tokens").and_then(Value::as_array).cloned().unwrap_or_default()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Pass 2: per chain, attach decimals (token_list) to the held tokens → the
+        // uniswap price-request JSON.
+        let preps: Vec<(u64, String)> = chain_data
+            .into_iter()
+            .map(|(chain_id, toks)| {
+                let meta = self.token_meta(chain_id as i64);
+                let held: Vec<Value> = toks
+                    .iter()
+                    .filter_map(|t| {
+                        let addr = t.get("address").and_then(Value::as_str)?;
+                        let bal = t.get("balance").and_then(Value::as_str).unwrap_or("0");
+                        if addr.is_empty() || parse_u256_str(bal).is_zero() {
+                            return None;
+                        }
+                        let dec = meta.get(&addr.to_lowercase()).map(|m| m.1).unwrap_or(18);
+                        Some(json!({ "address": addr, "decimals": dec }))
+                    })
+                    .collect();
+                (chain_id, json!({ "tokens": held }).to_string())
+            })
+            .collect();
+        let cache = {
+            let st = match self.st() {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            Arc::clone(&st.market_prices)
+        };
+
+        // One concurrent uniswap.get_prices per chain (uniswap is concurrency:"multi",
+        // so they overlap). Fire-and-return; the final completion caches the prices
+        // and emits market_updated. get_market then reads the cache.
+        let tasks: Vec<GatherTask<(u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>)>> = preps
+            .into_iter()
+            .map(|(chain_id, req)| {
+                let t: GatherTask<(u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>)> =
+                    Box::new(move |done| {
+                        modules().uniswap_module.get_prices_async(chain_id as i64, &req, move |res| {
+                            done((chain_id, decode_uniswap_prices(res.ok())));
+                        });
+                    });
+                t
+            })
+            .collect();
+
+        let addr = address;
+        gather(
+            tasks,
+            move |results: Vec<(u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>)>| {
+                {
+                    let mut c = cache.lock().unwrap();
+                    for (chain, prices) in results {
+                        c.insert(chain, prices);
+                    }
+                }
+                emit_market_updated(&addr);
+            },
+        );
         true
     }
 
