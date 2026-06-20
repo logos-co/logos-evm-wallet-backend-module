@@ -22,6 +22,11 @@
       url = "github:logos-co/logos-evm-token-list-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
+    uniswap_module = {
+      url = "github:logos-co/logos-evm-uniswap-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+      inputs.eth_rpc_module.follows = "eth_rpc_module";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

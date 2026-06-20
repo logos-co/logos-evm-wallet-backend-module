@@ -14,6 +14,7 @@
 use alloy::primitives::{Address, U256};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc; // `Mutex` is already in scope from the generated provider glue.
 
 use crate::config::{ChainInfo, ConfigStore, ProxySettings};
 use crate::history::{now_secs, History, TxRecord};
@@ -45,6 +46,9 @@ pub trait WalletBackendModule: Send + 'static {
     // ── balances (Multicall3-batched) ──
     fn refresh_balances(&mut self, address: String) -> bool;
     fn get_balances(&mut self, address: String) -> String;
+
+    // ── market (Uniswap prices for held tokens) ──
+    fn get_market(&mut self, address: String) -> String;
 
     // ── send ──
     fn estimate_fee(&mut self, send_json: String) -> String;
@@ -78,7 +82,10 @@ struct State {
     /// chainId -> watched token addresses (persisted in watched.json).
     watched: std::collections::HashMap<u64, Vec<String>>,
     /// address -> last aggregate balances (persisted in balances_cache.json).
-    balances: std::collections::HashMap<String, Value>,
+    /// `Arc<Mutex<_>>` so the async balance-refresh fan-out's completion callback
+    /// (a `'static` closure that can't borrow `&self`) can write it; the event
+    /// loop is single-threaded, so the lock is effectively uncontended.
+    balances: Arc<Mutex<std::collections::HashMap<String, Value>>>,
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────
@@ -112,6 +119,23 @@ fn parse_hex_u64(s: &str) -> u64 {
     u64::from_str_radix(h, 16).unwrap_or(0)
 }
 
+/// `balance / 10^decimals * usd` as a display value (f64 is ample for UI).
+fn value_usd(balance: &str, decimals: u8, usd: Option<f64>) -> Option<f64> {
+    let usd = usd?;
+    let bal: f64 = parse_u256_str(balance).to_string().parse().unwrap_or(0.0);
+    Some(bal / 10f64.powi(decimals as i32) * usd)
+}
+
+/// Fallback symbol for an unknown token: `0x1234…abcd`.
+fn short_addr(a: &str) -> String {
+    let t = a.trim_start_matches("0x");
+    if t.len() >= 8 {
+        format!("0x{}…{}", &t[..4], &t[t.len() - 4..])
+    } else {
+        a.to_string()
+    }
+}
+
 fn parse_u256_str(s: &str) -> U256 {
     let t = s.trim();
     if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
@@ -119,6 +143,169 @@ fn parse_u256_str(s: &str) -> U256 {
     } else {
         t.parse::<U256>().unwrap_or(U256::ZERO)
     }
+}
+
+// ── async balance fan-out (over the concurrency:"multi" eth_rpc) ──────────────
+//
+// `refresh_balances` fires one async eth_rpc call per chain (a single Multicall3
+// `eth_call` when available, else native + per-token via a nested gather) and
+// returns immediately. Because eth_rpc is `concurrency: "multi"`, the calls run
+// in parallel; `gather` collects them and the final completion writes the cache
+// and emits `balances_updated` — the same contract every consumer already uses.
+
+type GatherDone<T> = Box<dyn FnOnce(T) + Send>;
+type GatherTask<T> = Box<dyn FnOnce(GatherDone<T>) + Send>;
+
+/// Fire every task; invoke `on_all` with all results (in task order) once the last
+/// completes. Each task fires its async dep call(s) and hands its result to `done`.
+/// Generic + dependency-free — a candidate to lift into the rust SDK.
+#[allow(clippy::type_complexity)]
+fn gather<T: Send + 'static>(tasks: Vec<GatherTask<T>>, on_all: impl FnOnce(Vec<T>) + Send + 'static) {
+    let n = tasks.len();
+    if n == 0 {
+        on_all(Vec::new());
+        return;
+    }
+    let state: Arc<Mutex<(Vec<Option<T>>, usize, Option<Box<dyn FnOnce(Vec<T>) + Send>>)>> =
+        Arc::new(Mutex::new(((0..n).map(|_| None).collect(), n, Some(Box::new(on_all)))));
+    for (i, task) in tasks.into_iter().enumerate() {
+        let state = Arc::clone(&state);
+        task(Box::new(move |result: T| {
+            let mut s = state.lock().unwrap();
+            s.0[i] = Some(result);
+            s.1 -= 1;
+            if s.1 == 0 {
+                let results: Vec<T> = s.0.drain(..).map(|o| o.expect("gather slot filled")).collect();
+                let cb = s.2.take().expect("gather on_all fires once");
+                drop(s);
+                cb(results);
+            }
+        }));
+    }
+}
+
+/// One chain's balances → `{ chainId, native, tokens }`, fetched async. Common
+/// case: a single Multicall3 `eth_call`; else native + per-token via nested gather.
+fn fetch_chain_async(
+    chain_id: u64,
+    holder: Address,
+    holder_hex: String,
+    multicall: Option<String>,
+    tokens: Vec<String>,
+    done: GatherDone<Value>,
+) {
+    if let Some(mc) = multicall {
+        if let Some(call_json) = build_multicall_call_json(&mc, holder, &tokens) {
+            modules().eth_rpc_module.call_async(chain_id as i64, &call_json, move |res| {
+                done(decode_multicall_chain(chain_id, &tokens, res.ok()));
+            });
+            return;
+        }
+    }
+    fetch_chain_individual_async(chain_id, holder, holder_hex, tokens, done);
+}
+
+/// Fallback for chains without Multicall3: native `eth_getBalance` + one `eth_call`
+/// per token, gathered into the same chain value.
+fn fetch_chain_individual_async(
+    chain_id: u64,
+    holder: Address,
+    holder_hex: String,
+    tokens: Vec<String>,
+    done: GatherDone<Value>,
+) {
+    let mut tasks: Vec<GatherTask<(usize, U256)>> = Vec::with_capacity(tokens.len() + 1);
+    tasks.push(Box::new(move |d| {
+        modules()
+            .eth_rpc_module
+            .get_balance_async(chain_id as i64, &holder_hex, move |res| d((0, decode_balance_reply(res.ok()))));
+    }));
+    for (i, t) in tokens.iter().enumerate() {
+        let call_json = erc20_balance_call_json(t, holder);
+        let slot = i + 1;
+        tasks.push(Box::new(move |d| {
+            modules()
+                .eth_rpc_module
+                .call_async(chain_id as i64, &call_json, move |res| d((slot, decode_call_balance_reply(res.ok()))));
+        }));
+    }
+    gather(tasks, move |parts: Vec<(usize, U256)>| {
+        let mut by_slot: std::collections::HashMap<usize, U256> = std::collections::HashMap::new();
+        for (s, v) in parts {
+            by_slot.insert(s, v);
+        }
+        let native = by_slot.get(&0).copied().unwrap_or(U256::ZERO);
+        let token_balances: Vec<Value> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| json!({ "address": t, "balance": by_slot.get(&(i + 1)).copied().unwrap_or(U256::ZERO).to_string() }))
+            .collect();
+        done(json!({ "chainId": chain_id, "native": native.to_string(), "tokens": token_balances }));
+    });
+}
+
+fn build_multicall_call_json(mc: &str, holder: Address, tokens: &[String]) -> Option<String> {
+    let mc_addr = parse_addr(mc).ok()?;
+    let mut calls: Vec<(Address, Vec<u8>)> = vec![(mc_addr, txbuild::multicall3_get_eth_balance_calldata(holder))];
+    for t in tokens {
+        calls.push((parse_addr(t).ok()?, txbuild::erc20_balance_of_calldata(holder)));
+    }
+    let data = txbuild::multicall3_aggregate3_calldata(&calls);
+    Some(json!({ "to": mc, "data": format!("0x{}", hex::encode(data)) }).to_string())
+}
+
+fn erc20_balance_call_json(token: &str, holder: Address) -> String {
+    let data = txbuild::erc20_balance_of_calldata(holder);
+    json!({ "to": token, "data": format!("0x{}", hex::encode(data)) }).to_string()
+}
+
+fn empty_chain(chain_id: u64, tokens: &[String]) -> Value {
+    let token_balances: Vec<Value> = tokens.iter().map(|t| json!({ "address": t, "balance": "0" })).collect();
+    json!({ "chainId": chain_id, "native": "0", "tokens": token_balances })
+}
+
+/// Decode a Multicall3 `aggregate3` reply (the `{ ok, result }` string from
+/// eth_rpc.call) into `{ chainId, native, tokens }`. Any failure degrades to zeros.
+fn decode_multicall_chain(chain_id: u64, tokens: &[String], reply: Option<String>) -> Value {
+    let rets = reply
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(|v| v.get("ok").and_then(Value::as_bool) != Some(false))
+        .and_then(|v| v["result"].as_str().map(String::from))
+        .and_then(|h| hex::decode(h.trim_start_matches("0x")).ok())
+        .and_then(|b| txbuild::decode_aggregate3_returns(&b));
+    let Some(rets) = rets else {
+        return empty_chain(chain_id, tokens);
+    };
+    let native = rets.first().and_then(|o| o.as_ref()).and_then(|d| txbuild::decode_uint256(d)).unwrap_or(U256::ZERO);
+    let token_balances: Vec<Value> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let bal = rets.get(i + 1).and_then(|o| o.as_ref()).and_then(|d| txbuild::decode_uint256(d)).unwrap_or(U256::ZERO);
+            json!({ "address": t, "balance": bal.to_string() })
+        })
+        .collect();
+    json!({ "chainId": chain_id, "native": native.to_string(), "tokens": token_balances })
+}
+
+/// Decode a native `eth_getBalance` reply (`{ ok, result: "0x.." }`) → U256.
+fn decode_balance_reply(reply: Option<String>) -> U256 {
+    reply
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(|v| v.get("ok").and_then(Value::as_bool) != Some(false))
+        .and_then(|v| v["result"].as_str().map(parse_u256_str))
+        .unwrap_or(U256::ZERO)
+}
+
+/// Decode an ERC20 `balanceOf` `eth_call` reply (`{ ok, result: "0x..32" }`) → U256.
+fn decode_call_balance_reply(reply: Option<String>) -> U256 {
+    reply
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(|v| v.get("ok").and_then(Value::as_bool) != Some(false))
+        .and_then(|v| v["result"].as_str().map(String::from))
+        .and_then(|h| hex::decode(h.trim_start_matches("0x")).ok())
+        .and_then(|b| txbuild::decode_uint256(&b))
+        .unwrap_or(U256::ZERO)
 }
 
 #[derive(Deserialize)]
@@ -148,7 +335,7 @@ impl WalletBackendModuleImpl {
     fn save_balances(st: &State) {
         let _ = std::fs::write(
             st.dir.join("balances_cache.json"),
-            serde_json::to_string_pretty(&st.balances).unwrap_or_default(),
+            serde_json::to_string_pretty(&*st.balances.lock().unwrap()).unwrap_or_default(),
         );
     }
 
@@ -161,78 +348,128 @@ impl WalletBackendModuleImpl {
         }
     }
 
-    /// Fetch native + watched-token balances for one chain with a single
-    /// Multicall3 `eth_call`. Falls back to per-call `eth_getBalance` if the
-    /// chain has no Multicall3 or the batch fails.
-    fn fetch_chain(&mut self, chain_id: u64, holder: &str) -> std::result::Result<Value, String> {
-        let (mc, tokens): (Option<String>, Vec<String>) = {
+    /// Combine cached balances (tokens with balance > 0) with Uniswap prices for
+    /// the wallet's **Market** view. Per chain: pull held tokens from the cached
+    /// aggregate, look up symbol/decimals from `token_list`, ask `uniswap_module`
+    /// for token→ETH/USD prices (best-rate, one Multicall3 eth_call), and attach
+    /// a `valueUsd` to each holding (and to native ETH). Pricing failures degrade
+    /// gracefully to null prices — the holding still shows.
+    fn build_market(&mut self, address: &str) -> std::result::Result<Value, String> {
+        let cached = {
             let st = self.st()?;
-            let chain = st.cfg.chain(chain_id).ok_or_else(|| format!("no chain {chain_id}"))?;
-            (chain.multicall3_addr(), st.watched.get(&chain_id).cloned().unwrap_or_default())
+            st.balances.lock().unwrap().get(address).cloned()
         };
-        let holder_addr = parse_addr(holder)?;
+        let Some(cached) = cached else {
+            return Ok(json!({ "ok": true, "address": address, "chains": [] }));
+        };
+        let empty = Vec::new();
+        let chains = cached.get("chains").and_then(Value::as_array).unwrap_or(&empty);
 
-        if let Some(mc) = mc {
-            if let Ok(v) = self.fetch_chain_multicall(chain_id, holder_addr, &mc, &tokens) {
-                return Ok(v);
+        let mut chains_out = Vec::new();
+        for chain in chains {
+            let chain_id = chain.get("chainId").and_then(Value::as_u64).unwrap_or(0);
+            if chain_id == 0 {
+                continue;
+            }
+
+            // symbol/decimals lookup (lowercased address -> (symbol, decimals)).
+            let meta = self.token_meta(chain_id as i64);
+
+            // Held tokens (balance > 0) → the set we price.
+            let empty_toks = Vec::new();
+            let toks = chain.get("tokens").and_then(Value::as_array).unwrap_or(&empty_toks);
+            let mut held: Vec<(String, u8)> = Vec::new();
+            for t in toks {
+                let addr = t.get("address").and_then(Value::as_str).unwrap_or("");
+                let bal = t.get("balance").and_then(Value::as_str).unwrap_or("0");
+                if addr.is_empty() || parse_u256_str(bal).is_zero() {
+                    continue;
+                }
+                let dec = meta.get(&addr.to_lowercase()).map(|m| m.1).unwrap_or(18);
+                held.push((addr.to_string(), dec));
+            }
+
+            // Ask Uniswap for prices (held tokens; module adds stablecoins itself).
+            let prices = self.uniswap_prices(chain_id as i64, &held);
+
+            // Native ETH item.
+            let native_bal = chain.get("native").and_then(Value::as_str).unwrap_or("0");
+            let eth_usd = prices.get("ETH").and_then(|p| p.1);
+            let mut items = vec![json!({
+                "address": "native",
+                "symbol": "ETH",
+                "decimals": 18,
+                "balance": native_bal,
+                "eth": 1.0,
+                "usd": eth_usd,
+                "valueUsd": value_usd(native_bal, 18, eth_usd),
+            })];
+
+            for (addr, dec) in &held {
+                let (symbol, _) = meta.get(&addr.to_lowercase()).cloned().unwrap_or_else(|| (short_addr(addr), *dec));
+                let bal = toks
+                    .iter()
+                    .find(|t| t.get("address").and_then(Value::as_str) == Some(addr.as_str()))
+                    .and_then(|t| t.get("balance").and_then(Value::as_str))
+                    .unwrap_or("0");
+                let (eth, usd) = prices.get(addr.as_str()).copied().unwrap_or((None, None));
+                items.push(json!({
+                    "address": addr,
+                    "symbol": symbol,
+                    "decimals": dec,
+                    "balance": bal,
+                    "eth": eth,
+                    "usd": usd,
+                    "valueUsd": value_usd(bal, *dec, usd),
+                }));
+            }
+
+            chains_out.push(json!({ "chainId": chain_id, "items": items }));
+        }
+        Ok(json!({ "ok": true, "address": address, "chains": chains_out }))
+    }
+
+    /// `token_list.get_tokens(chainId)` → lowercased address -> (symbol, decimals).
+    fn token_meta(&mut self, chain_id: i64) -> std::collections::HashMap<String, (String, u8)> {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(s) = modules().token_list_module.get_tokens(chain_id) {
+            if let Ok(v) = serde_json::from_str::<Value>(&s) {
+                if let Some(arr) = v.get("tokens").and_then(Value::as_array) {
+                    for t in arr {
+                        if let Some(addr) = t.get("address").and_then(Value::as_str) {
+                            let sym = t.get("symbol").and_then(Value::as_str).unwrap_or("?").to_string();
+                            let dec = t.get("decimals").and_then(Value::as_u64).unwrap_or(18) as u8;
+                            map.insert(addr.to_lowercase(), (sym, dec));
+                        }
+                    }
+                }
             }
         }
-        self.fetch_chain_individual(chain_id, holder, &tokens)
+        map
     }
 
-    fn fetch_chain_multicall(
-        &mut self,
-        chain_id: u64,
-        holder: Address,
-        mc: &str,
-        tokens: &[String],
-    ) -> std::result::Result<Value, String> {
-        let mc_addr = parse_addr(mc)?;
-        let mut calls: Vec<(Address, Vec<u8>)> =
-            vec![(mc_addr, txbuild::multicall3_get_eth_balance_calldata(holder))];
-        for t in tokens {
-            calls.push((parse_addr(t)?, txbuild::erc20_balance_of_calldata(holder)));
+    /// Ask `uniswap_module` for token→(eth, usd) prices, keyed by the address
+    /// string we passed (plus an `"ETH"` entry for native). Empty on failure.
+    fn uniswap_prices(&mut self, chain_id: i64, held: &[(String, u8)]) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
+        let mut out = std::collections::HashMap::new();
+        let tokens: Vec<Value> = held.iter().map(|(a, d)| json!({ "address": a, "decimals": d })).collect();
+        let req = json!({ "tokens": tokens }).to_string();
+        let resp = match modules().uniswap_module.get_prices(chain_id, &req) {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
+        if let Ok(v) = serde_json::from_str::<Value>(&resp) {
+            if let Some(arr) = v.get("prices").and_then(Value::as_array) {
+                for p in arr {
+                    if let Some(addr) = p.get("address").and_then(Value::as_str) {
+                        let eth = p.get("eth").and_then(Value::as_f64);
+                        let usd = p.get("usd").and_then(Value::as_f64);
+                        out.insert(addr.to_string(), (eth, usd));
+                    }
+                }
+            }
         }
-        let data = txbuild::multicall3_aggregate3_calldata(&calls);
-        let call_json = json!({ "to": mc, "data": format!("0x{}", hex::encode(data)) }).to_string();
-        let resp = ok_value(modules().eth_rpc_module.call(chain_id as i64, &call_json).map_err(|e| e.to_string())?)?;
-        let result_hex = resp["result"].as_str().ok_or("multicall: no result")?;
-        let bytes = hex::decode(result_hex.trim_start_matches("0x")).map_err(|e| e.to_string())?;
-        let rets = txbuild::decode_aggregate3_returns(&bytes).ok_or("multicall: decode failed")?;
-
-        let native = rets.first().and_then(|o| o.as_ref()).and_then(|d| txbuild::decode_uint256(d)).unwrap_or(U256::ZERO);
-        let mut token_balances = Vec::new();
-        for (i, t) in tokens.iter().enumerate() {
-            let bal = rets.get(i + 1).and_then(|o| o.as_ref()).and_then(|d| txbuild::decode_uint256(d)).unwrap_or(U256::ZERO);
-            token_balances.push(json!({ "address": t, "balance": bal.to_string() }));
-        }
-        Ok(json!({ "chainId": chain_id, "native": native.to_string(), "tokens": token_balances }))
-    }
-
-    fn fetch_chain_individual(
-        &mut self,
-        chain_id: u64,
-        holder: &str,
-        tokens: &[String],
-    ) -> std::result::Result<Value, String> {
-        let native_resp = ok_value(
-            modules().eth_rpc_module.get_balance(chain_id as i64, holder).map_err(|e| e.to_string())?,
-        )?;
-        let native = parse_u256_str(native_resp["result"].as_str().unwrap_or("0x0"));
-        let mut token_balances = Vec::new();
-        for t in tokens {
-            let data = txbuild::erc20_balance_of_calldata(parse_addr(holder)?);
-            let call_json = json!({ "to": t, "data": format!("0x{}", hex::encode(data)) }).to_string();
-            let bal = match ok_value(modules().eth_rpc_module.call(chain_id as i64, &call_json).map_err(|e| e.to_string())?) {
-                Ok(v) => v["result"]
-                    .as_str()
-                    .and_then(|h| txbuild::decode_uint256(&hex::decode(h.trim_start_matches("0x")).ok()?))
-                    .unwrap_or(U256::ZERO),
-                Err(_) => U256::ZERO,
-            };
-            token_balances.push(json!({ "address": t, "balance": bal.to_string() }));
-        }
-        Ok(json!({ "chainId": chain_id, "native": native.to_string(), "tokens": token_balances }))
+        out
     }
 
     /// Build → sign → broadcast → record. `erc20` carries (token, amount) when set.
@@ -318,10 +555,12 @@ impl WalletBackendModule for WalletBackendModuleImpl {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
-        let balances = std::fs::read_to_string(dir.join("balances_cache.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
+        let balances = Arc::new(Mutex::new(
+            std::fs::read_to_string(dir.join("balances_cache.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default(),
+        ));
         let st = State { cfg, history, dir, watched, balances };
         Self::push_chain_configs(&st);
         self.state = Some(st);
@@ -443,31 +682,68 @@ impl WalletBackendModule for WalletBackendModuleImpl {
     }
 
     fn refresh_balances(&mut self, address: String) -> bool {
-        let chain_ids: Vec<u64> = match self.st() {
-            Ok(st) => st.cfg.config().chains.iter().map(|c| c.chain_id).collect(),
+        let holder = match parse_addr(&address) {
+            Ok(a) => a,
             Err(_) => return false,
         };
-        let mut per_chain = Vec::new();
-        for chain_id in chain_ids {
-            if let Ok(v) = self.fetch_chain(chain_id, &address) {
-                per_chain.push(v);
+        // Snapshot what the fan-out needs from State, then drop the borrow: the
+        // async callbacks fire later (on the event loop) and can't touch `&self`.
+        let (specs, cache, dir) = {
+            let st = match self.st() {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let chains: Vec<(u64, Option<String>)> =
+                st.cfg.config().chains.iter().map(|c| (c.chain_id, c.multicall3_addr())).collect();
+            let specs: Vec<(u64, Option<String>, Vec<String>)> = chains
+                .into_iter()
+                .map(|(id, mc)| (id, mc, st.watched.get(&id).cloned().unwrap_or_default()))
+                .collect();
+            (specs, Arc::clone(&st.balances), st.dir.clone())
+        };
+
+        // One concurrent task per chain (eth_rpc is concurrency:"multi", so they
+        // overlap instead of serializing). Fire-and-return; the final completion
+        // writes the cache and emits `balances_updated` — contract unchanged.
+        let tasks: Vec<GatherTask<Value>> = specs
+            .into_iter()
+            .map(|(chain_id, mc, tokens)| {
+                let holder_hex = address.clone();
+                let t: GatherTask<Value> =
+                    Box::new(move |done| fetch_chain_async(chain_id, holder, holder_hex, mc, tokens, done));
+                t
+            })
+            .collect();
+
+        let addr = address;
+        gather(tasks, move |chains: Vec<Value>| {
+            let aggregate = json!({ "address": addr, "chains": chains });
+            {
+                let mut map = cache.lock().unwrap();
+                map.insert(addr.clone(), aggregate);
+                let _ = std::fs::write(
+                    dir.join("balances_cache.json"),
+                    serde_json::to_string_pretty(&*map).unwrap_or_default(),
+                );
             }
-        }
-        let aggregate = json!({ "address": address, "chains": per_chain });
-        if let Ok(st) = self.st() {
-            st.balances.insert(address.clone(), aggregate);
-            Self::save_balances(st);
-        }
-        emit_balances_updated(&address);
+            emit_balances_updated(&addr);
+        });
         true
     }
 
     fn get_balances(&mut self, address: String) -> String {
         match self.st() {
-            Ok(st) => match st.balances.get(&address) {
+            Ok(st) => match st.balances.lock().unwrap().get(&address) {
                 Some(v) => json!({ "ok": true, "balances": v }).to_string(),
                 None => json!({ "ok": true, "balances": { "address": address, "chains": [] } }).to_string(),
             },
+            Err(e) => err(e),
+        }
+    }
+
+    fn get_market(&mut self, address: String) -> String {
+        match self.build_market(&address) {
+            Ok(v) => v.to_string(),
             Err(e) => err(e),
         }
     }
