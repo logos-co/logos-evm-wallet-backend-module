@@ -1,0 +1,276 @@
+name: "Concurrent multi-chain balance refresh (wallet-backend fan-out)"
+output: wallet-backend-fanout.md
+release: ""
+
+intro: |
+  `wallet_backend_module.refresh_balances(address)` refreshes balances across
+  **every configured chain at once**. It fires **one async `eth_rpc` call per
+  chain** (a single Multicall3 `eth_call`) through a small `gather` helper and
+  returns immediately; the final completion writes the cache and emits
+  `balances_updated`. Because `eth_rpc_module` is **`concurrency: "multi"`**, the
+  per-chain calls **overlap** instead of running one after another.
+
+  This doc-test proves the overlap end-to-end, deterministically. It points four
+  wallet chains at a **concurrent, peak-tracking mock JSON-RPC node** (a
+  `ThreadingHTTPServer` that holds each request open ~400 ms and records the peak
+  number of requests in flight at once), fires `refresh_balances`, and reads the
+  peak:
+
+  - With `eth_rpc` `"multi"`, the four per-chain `eth_call`s reach the node
+    together → **peak == 4**.
+  - Were `eth_rpc` `"single"`, they would serialize → peak would be **1**.
+
+what_you_build: "The wallet stack (`eth_rpc` [multi] + `wallet_backend` + `keystore` + `token_list` + `uniswap`), driven through a `logoscore` daemon against a concurrent mock node, proving the balance refresh fans out in parallel."
+
+what_you_learn:
+  - How `refresh_balances` fans out one async `eth_call` per chain through a `gather` helper
+  - "Why the callee (`eth_rpc`) being `concurrency: \"multi\"` is what makes the fan-out overlap"
+  - How to prove concurrency deterministically with a peak-tracking concurrent mock server
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled. Install from [nixos.org](https://nixos.org/download.html), then enable flakes:
+
+    ```bash
+    mkdir -p ~/.config/nix
+    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf
+    ```
+  - "**A Linux or macOS machine** with `python3` available (runs the local concurrent mock JSON-RPC node)."
+
+sections:
+  - title: "Build logoscore and lgpm"
+    step: true
+    text: |
+      The daemon resolves a `multi` module's deferred reply on the caller's
+      behalf, so logoscore must be built against logos-protocol ≥ 0.2 — the
+      `--override-input` pins its protocol (and liblogos's) to the chain under test
+      (master, once 0.2 is published the plain `nix build` suffices).
+    steps:
+      - title: "Build logoscore"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --override-input logos-protocol 'github:logos-co/logos-protocol{release}' --override-input logos-liblogos/logos-protocol 'github:logos-co/logos-protocol{release}' --out-link ./logos"
+        code_block: |
+          nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos
+        check_file: "logos/bin/logoscore"
+      - title: "Build lgpm"
+        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
+        check_file: "lgpm/bin/lgpm"
+
+  - title: "Build the wallet modules as .lgx"
+    step: true
+    text: |
+      Five modules go into one `./modules` dir; `load-module wallet_backend_module`
+      auto-resolves and loads its four dependencies. The `{release}` overrides pin
+      the builder + SDKs to the commits under test, so the concurrency codegen is
+      the one exercised; **`eth_rpc` carries `concurrency: "multi"`**.
+    steps:
+      - title: "Build eth_rpc_module (.lgx) — the concurrency:\"multi\" client"
+        run: |
+          nix build 'github:logos-co/logos-evm-eth-rpc-module{release}#lgx' --no-write-lock-file -o eth-rpc-lgx \
+            --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
+            --override-input logos-module-builder/logos-rust-sdk 'github:logos-co/logos-rust-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
+            --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol{release}'
+        code_block: |
+          nix build 'github:logos-co/logos-evm-eth-rpc-module{release}#lgx' -o eth-rpc-lgx
+        extra_run:
+          run: "ls eth-rpc-lgx/*.lgx"
+      - title: "Build keystore_module (.lgx)"
+        run: |
+          nix build 'github:logos-co/logos-evm-keystore-module{release}#lgx' --no-write-lock-file -o keystore-lgx \
+            --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
+            --override-input logos-module-builder/logos-rust-sdk 'github:logos-co/logos-rust-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
+            --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol{release}'
+      - title: "Build token_list_module (.lgx)"
+        run: |
+          nix build 'github:logos-co/logos-evm-token-list-module{release}#lgx' --no-write-lock-file -o token-list-lgx \
+            --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
+            --override-input logos-module-builder/logos-rust-sdk 'github:logos-co/logos-rust-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
+            --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol{release}'
+      - title: "Build uniswap_module (.lgx)"
+        run: |
+          nix build 'github:logos-co/logos-evm-uniswap-module{release}#lgx' --no-write-lock-file -o uniswap-lgx \
+            --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
+            --override-input logos-module-builder/logos-rust-sdk 'github:logos-co/logos-rust-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
+            --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol{release}'
+      - title: "Build wallet_backend_module (.lgx) — the fan-out coordinator"
+        run: |
+          nix build 'github:logos-co/logos-evm-wallet-backend-module{release}#lgx' --no-write-lock-file -o wallet-backend-lgx \
+            --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
+            --override-input logos-module-builder/logos-rust-sdk 'github:logos-co/logos-rust-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
+            --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol{release}'
+        extra_run:
+          run: "ls wallet-backend-lgx/*.lgx"
+
+  - title: "Install the modules"
+    step: true
+    steps:
+      - title: "Seed the capability module"
+        run: |
+          mkdir -p modules
+          cp -RL ./logos/modules/. ./modules/
+        check_file: "modules/capability_module/manifest.json"
+      - title: "Install all five .lgx with lgpm"
+        run: |
+          for f in eth-rpc-lgx keystore-lgx token-list-lgx uniswap-lgx wallet-backend-lgx; do
+            ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file "$f"/*.lgx
+          done
+        expect_contains:
+          - "Installed to:"
+      - title: "Confirm the installs"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules list"
+        expect_contains:
+          - "wallet_backend_module"
+          - "eth_rpc_module"
+
+  - title: "Start the concurrent, peak-tracking mock node"
+    step: true
+    text: |
+      A `ThreadingHTTPServer` (one thread per request) — concurrency is the whole
+      point: a single-threaded server would serialize the requests and the peak
+      would always read 1. Each request is held open ~400 ms and the peak number
+      of simultaneously in-flight requests is recorded under a lock. `GET /peak`
+      returns it; `POST /reset` zeroes it.
+    steps:
+      - title: "Write the mock node"
+        file:
+          path: mock_node.py
+          content: |
+            import http.server, json, threading, time
+            from http.server import ThreadingHTTPServer
+
+            LOCK = threading.Lock()
+            INFLIGHT = 0
+            PEAK = 0
+            HOLD_SECS = 0.4  # hold each request open so concurrent calls overlap
+
+            class H(http.server.BaseHTTPRequestHandler):
+                def _send(self, body, code=200):
+                    self.send_response(code)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def do_POST(self):
+                    global INFLIGHT, PEAK
+                    n = int(self.headers.get("content-length", 0) or 0)
+                    raw = self.rfile.read(n) if n else b"{}"
+                    if self.path.rstrip("/") == "/reset":
+                        with LOCK:
+                            INFLIGHT = 0
+                            PEAK = 0
+                        self._send(b"reset")
+                        return
+                    try:
+                        req = json.loads(raw or b"{}")
+                    except Exception:
+                        req = {}
+                    with LOCK:
+                        INFLIGHT += 1
+                        if INFLIGHT > PEAK:
+                            PEAK = INFLIGHT
+                    time.sleep(HOLD_SECS)  # keep the request in flight so peers overlap
+                    with LOCK:
+                        INFLIGHT -= 1
+                    body = json.dumps({"jsonrpc": "2.0", "id": req.get("id", 1), "result": "0x"}).encode()
+                    self._send(body)
+
+                def do_GET(self):
+                    if self.path.rstrip("/") == "/peak":
+                        with LOCK:
+                            p = PEAK
+                        self._send(str(p).encode())
+                        return
+                    self._send(b"ok")
+
+                def log_message(self, *a):
+                    pass
+
+            if __name__ == "__main__":
+                ThreadingHTTPServer(("127.0.0.1", 8611), H).serve_forever()
+      - title: "Start the mock node"
+        run: "sh -c 'python3 mock_node.py > mock.log 2>&1 &'"
+        code_block: "python3 mock_node.py &"
+      - run: "sleep 2"
+      - title: "Confirm the mock is up (and ours)"
+        text: "A bare `GET /` returns `ok` from our mock — a port squat would answer differently."
+        run: "curl -s --max-time 5 http://127.0.0.1:8611/ || true"
+        expect_contains:
+          - "ok"
+
+  - title: "Configure four chains, then fan out"
+    step: true
+    steps:
+      - title: "Write the four-chain config"
+        text: |
+          Four distinct `chainId`s, all pointing at the mock, each with the canonical
+          Multicall3 address — so each chain is exactly **one** `eth_call` (the fast
+          Multicall3 path). No watched tokens, so it stays one request per chain.
+        file:
+          path: chains.json
+          content: |
+            [
+              { "chainId": 1,     "name": "c1", "rpcUrl": "http://127.0.0.1:8611", "nativeSymbol": "ETH", "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11" },
+              { "chainId": 10,    "name": "c2", "rpcUrl": "http://127.0.0.1:8611", "nativeSymbol": "ETH", "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11" },
+              { "chainId": 42161, "name": "c3", "rpcUrl": "http://127.0.0.1:8611", "nativeSymbol": "ETH", "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11" },
+              { "chainId": 8453,  "name": "c4", "rpcUrl": "http://127.0.0.1:8611", "nativeSymbol": "ETH", "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11" }
+            ]
+      - title: "Start the daemon"
+        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
+        code_block: "logoscore -D -m ./modules > logs.txt &"
+      - run: "sleep 6"
+      - title: "Load the backend (its four deps auto-load)"
+        run: "./logos/bin/logoscore load-module wallet_backend_module"
+        code_block: "logoscore load-module wallet_backend_module"
+        expect_contains:
+          - "wallet_backend_module"
+          - "eth_rpc_module"
+      - title: "Configure the four chains"
+        run: "./logos/bin/logoscore call wallet_backend_module set_chains @chains.json"
+        code_block: "logoscore call wallet_backend_module set_chains @chains.json"
+        expect_contains:
+          - "true"
+      - title: "Reset the mock's peak counter"
+        text: "Zero the peak right before the fan-out, so it reflects only `refresh_balances`."
+        run: "curl -s --max-time 10 -X POST http://127.0.0.1:8611/reset"
+        expect_contains:
+          - "reset"
+      - title: "Fan out: refresh balances across all four chains"
+        text: |
+          `refresh_balances` fires four async `eth_call`s at the (multi) `eth_rpc`
+          and returns immediately. It can hit a transient `RPC_FAILED` on a loaded
+          runner the first time the transport warms up; retry the trigger.
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call wallet_backend_module refresh_balances f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
+        code_block: "logoscore call wallet_backend_module refresh_balances <address>"
+        expect_contains:
+          - "true"
+      - run: "sleep 4"
+      - title: "The four calls overlapped (peak == 4)"
+        text: |
+          The mock's peak is the most `eth_call`s it saw in flight at once. Because
+          `eth_rpc` is `concurrency: "multi"`, all four overlapped → **4**. A
+          `"single"` `eth_rpc` would have served them one at a time → **1**.
+        run: "curl -s --max-time 10 http://127.0.0.1:8611/peak"
+        code_block: "curl http://127.0.0.1:8611/peak"
+        expect_contains:
+          - "4"
+      - title: "Stop the daemon and the mock node"
+        run: |
+          trap '' TERM
+          ./logos/bin/logoscore stop || true
+          pkill -f mock_node.py 2>/dev/null || true
+          true
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logoscore status || true"
+        expect_contains:
+          - '"status":"not_running"'
