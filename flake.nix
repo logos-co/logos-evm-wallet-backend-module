@@ -27,6 +27,12 @@
       inputs.logos-module-builder.follows = "logos-module-builder";
       inputs.eth_rpc_module.follows = "eth_rpc_module";
     };
+    railgun_module = {
+      url = "github:logos-co/logos-evm-railgun-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+      inputs.eth_rpc_module.follows = "eth_rpc_module";
+      inputs.keystore_module.follows = "keystore_module";
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

@@ -19,6 +19,7 @@ sol! {
         function decimals() external view returns (uint8);
         function symbol() external view returns (string);
         function transfer(address to, uint256 amount) external returns (bool);
+        function approve(address spender, uint256 amount) external returns (bool);
     }
 
     #[allow(missing_docs)]
@@ -57,6 +58,12 @@ fn u64_hex(v: u64) -> String {
 
 pub fn erc20_transfer_calldata(to: Address, amount: U256) -> Vec<u8> {
     IERC20::transferCall { to, amount }.abi_encode()
+}
+
+/// `approve(spender, amount)` calldata — used to authorize the RAILGUN smart
+/// wallet to pull tokens into the shielded pool before a shield.
+pub fn erc20_approve_calldata(spender: Address, amount: U256) -> Vec<u8> {
+    IERC20::approveCall { spender, amount }.abi_encode()
 }
 
 pub fn erc20_balance_of_calldata(owner: Address) -> Vec<u8> {
@@ -176,6 +183,26 @@ pub fn unsigned_erc20_tx(
     Value::Object(o)
 }
 
+/// A general keystore-signable tx for a pre-built `(to, value, data)` call —
+/// e.g. a RAILGUN shield/approve `TxData` produced by `railgun_module`.
+pub fn unsigned_call_tx(
+    to: Address,
+    value: U256,
+    data: &[u8],
+    nonce: u64,
+    gas_limit: u64,
+    fee: &Fee,
+) -> Value {
+    let mut o = serde_json::Map::new();
+    o.insert("to".into(), json!(to.to_string()));
+    o.insert("value".into(), json!(u256_hex(value)));
+    o.insert("nonce".into(), json!(u64_hex(nonce)));
+    o.insert("gas_limit".into(), json!(u64_hex(gas_limit)));
+    o.insert("data".into(), json!(hex0x(data)));
+    apply_fee(&mut o, fee);
+    Value::Object(o)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +226,27 @@ mod tests {
     fn erc20_balance_of_selector() {
         let data = erc20_balance_of_calldata(ALICE);
         assert_eq!(&data[0..4], &[0x70, 0xa0, 0x82, 0x31]);
+    }
+
+    #[test]
+    fn erc20_approve_selector_and_args() {
+        let data = erc20_approve_calldata(ALICE, U256::from(1_000_000u64));
+        // approve(address,uint256) selector 0x095ea7b3
+        assert_eq!(&data[0..4], &[0x09, 0x5e, 0xa7, 0xb3]);
+        assert_eq!(&data[4 + 12..4 + 32], ALICE.as_slice());
+        assert_eq!(decode_uint256(&data[36..68]).unwrap(), U256::from(1_000_000u64));
+    }
+
+    #[test]
+    fn unsigned_call_tx_carries_to_value_data() {
+        let fee = Fee::Eip1559 { max_fee_per_gas: U256::from(20u64), max_priority_fee_per_gas: U256::from(1u64) };
+        let data = vec![0xab, 0xcd];
+        let tx = unsigned_call_tx(USDC, U256::from(7u64), &data, 3, 250_000, &fee);
+        assert_eq!(tx["to"].as_str().unwrap().to_lowercase(), format!("{USDC}").to_lowercase());
+        assert_eq!(tx["value"], json!("0x7"));
+        assert_eq!(tx["data"], json!("0xabcd"));
+        assert_eq!(tx["nonce"], json!("0x3"));
+        assert_eq!(tx["fee_mode"], json!("eip1559"));
     }
 
     #[test]
