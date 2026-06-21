@@ -8067,11 +8067,38 @@
         "type": "github"
       }
     },
+    "railgun_module": {
+      "inputs": {
+        "eth_rpc_module": [
+          "eth_rpc_module"
+        ],
+        "keystore_module": [
+          "keystore_module"
+        ],
+        "logos-module-builder": [
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1782009381,
+        "narHash": "sha256-otElvYU+BAOTML0HcjBynLwICbbbveT5vxLv5Xw7FsY=",
+        "owner": "logos-co",
+        "repo": "logos-evm-railgun-module",
+        "rev": "9f1f39d55343e799ef952d1cbd8dc3f823b43d8b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-evm-railgun-module",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "eth_rpc_module": "eth_rpc_module",
         "keystore_module": "keystore_module",
         "logos-module-builder": "logos-module-builder",
+        "railgun_module": "railgun_module",
         "token_list_module": "token_list_module",
         "uniswap_module": "uniswap_module"
       }
