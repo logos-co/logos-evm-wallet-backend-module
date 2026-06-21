@@ -59,6 +59,31 @@ pub trait WalletBackendModule: Send + 'static {
     fn send_native(&mut self, send_json: String) -> String;
     fn send_erc20(&mut self, send_json: String) -> String;
 
+    // ── private (RAILGUN) ──
+    //
+    // ⚠️ UNAUDITED upstream engine; Sepolia-first. Spending/viewing keys never
+    // leave `railgun_module`; here we only coordinate.
+    /// Initialise the private (RAILGUN) account for `address` on `chain_id`. Derives
+    /// the railgun keys from a deterministic `keystore.sign_message` signature (the
+    /// EOA must be unlocked) and hands the seed to `railgun_module` (which derives +
+    /// holds the keys). Returns `{ ok, address: "0zk…" }`. Idempotent per EOA+chain.
+    fn init_private(&mut self, address: String, chain_id: i64) -> String;
+    /// The private `0zk…` address (`{ ok, address }`) — requires `init_private`.
+    fn get_zk_address(&mut self) -> String;
+    /// Sync the shielded state to the latest block (`{ ok }`).
+    fn sync_private(&mut self) -> String;
+    /// Shielded balance per asset (`{ ok, balances: [...] }`).
+    fn get_shielded_balance(&mut self) -> String;
+    /// SHIELD public ERC-20 into the pool: `{ from, chainId, asset, amount }`.
+    /// Approves the RAILGUN smart wallet then broadcasts the shield tx(s) — both
+    /// signed by keystore + broadcast by eth_rpc. Returns `{ ok, hash, approveHash }`.
+    fn shield(&mut self, send_json: String) -> String;
+    /// PRIVATE SEND (sender-hiding, via the 4337 relayer): `{ from, chainId, to,
+    /// asset, amount, memo?, bundlerUrl }`. `to` = `0zk…` → private transfer, `to` =
+    /// `0x…` → unshield. `railgun_module` builds+signs (via keystore)+submits the
+    /// UserOp through the bundler; returns `{ ok, userOpHash }`.
+    fn private_send(&mut self, send_json: String) -> String;
+
     // ── history ──
     fn get_history(&mut self, address: String) -> String;
     fn refresh_tx_status(&mut self, hash_hex: String, chain_id: i64) -> String;
@@ -347,6 +372,35 @@ struct SendParams {
     token_address: String, // erc20 only
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ShieldParams {
+    from: String,
+    chain_id: i64,
+    asset: String,  // ERC-20 token address
+    amount: String, // token base units
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrivateSendParams {
+    from: String, // the EOA owner of the 7702 smart account
+    chain_id: i64,
+    to: String,    // `0zk…` (private transfer) or `0x…` (unshield)
+    asset: String, // ERC-20 token address
+    amount: String,
+    #[serde(default)]
+    memo: String,
+    bundler_url: String,
+}
+
+/// Fixed message the EOA signs (deterministically) to derive its RAILGUN keys.
+/// The signature is the seed handed to `railgun_module.init_from_seed`; it must
+/// be kept secret (it is equivalent to the private RAILGUN keys it derives).
+const RAILGUN_SEED_MSG: &str =
+    "Logos Wallet — RAILGUN private account key derivation (v1). Signing this message \
+     derives your private (0zk) keys; it does not authorize any transaction. Keep it secret.";
+
 impl WalletBackendModuleImpl {
     fn st(&mut self) -> std::result::Result<&mut State, String> {
         self.state.as_mut().ok_or_else(|| "backend not initialized (context not ready)".to_string())
@@ -557,6 +611,109 @@ impl WalletBackendModuleImpl {
         }
         emit_tx_status_changed(&hash);
         Ok(json!({ "ok": true, "hash": hash }))
+    }
+
+    /// Build (gas from eth_rpc) → sign (keystore) → broadcast (eth_rpc) a pre-built
+    /// `(to, value, data)` call at `nonce`. Returns the tx hash. Shared by the
+    /// RAILGUN shield path (an `approve` then the shield `TxData`).
+    fn sign_and_broadcast_call(
+        &self,
+        from: &str,
+        chain_id: i64,
+        to: Address,
+        value: U256,
+        data: &[u8],
+        nonce: u64,
+        default_gas: u64,
+    ) -> std::result::Result<String, String> {
+        let gas_price = parse_u256_str(
+            ok_value(modules().eth_rpc_module.gas_price(chain_id).map_err(|e| e.to_string())?)?
+                ["result"].as_str().unwrap_or("0x0"),
+        );
+        let fee = Fee::Eip1559 {
+            max_fee_per_gas: gas_price.saturating_mul(U256::from(2)),
+            max_priority_fee_per_gas: gas_price,
+        };
+        let est_tx = json!({
+            "from": from,
+            "to": format!("{to}"),
+            "value": format!("0x{value:x}"),
+            "data": format!("0x{}", hex::encode(data)),
+        })
+        .to_string();
+        let gas_limit = match modules().eth_rpc_module.estimate_gas(chain_id, &est_tx) {
+            Ok(s) => ok_value(s).ok().and_then(|v| v["result"].as_str().map(parse_hex_u64)).unwrap_or(default_gas),
+            Err(_) => default_gas,
+        };
+        let unsigned = txbuild::unsigned_call_tx(to, value, data, nonce, gas_limit, &fee);
+        let signed = ok_value(
+            modules().keystore_module.sign_transaction(from, &unsigned.to_string(), chain_id).map_err(|e| e.to_string())?,
+        )?;
+        let raw = signed["raw"].as_str().ok_or("keystore: no raw tx")?.to_string();
+        let bcast = ok_value(
+            modules().eth_rpc_module.send_raw_transaction(chain_id, &raw).map_err(|e| e.to_string())?,
+        )?;
+        Ok(bcast["hash"].as_str().ok_or("broadcast: no hash")?.to_string())
+    }
+
+    /// SHIELD coordinator: prepare the shield TxData from `railgun_module`, approve
+    /// the RAILGUN smart wallet for the ERC-20, then broadcast each shield call.
+    fn do_shield(&mut self, p: &ShieldParams) -> std::result::Result<Value, String> {
+        let chain_id = p.chain_id;
+        let asset = parse_addr(&p.asset)?;
+        let amount = parse_u256_str(&p.amount);
+
+        // 1) Ask railgun for the shield TxData(s) (pure calldata — no proof).
+        let prep_params = json!({ "asset": p.asset, "amount": amount.to_string() }).to_string();
+        let prep = ok_value(
+            modules().railgun_module.prepare_shield(&prep_params).map_err(|e| e.to_string())?,
+        )?;
+        let txs = prep["txs"].as_array().cloned().unwrap_or_default();
+        if txs.is_empty() {
+            return Err("railgun: shield produced no transactions".into());
+        }
+        // The shield call's `to` is the RAILGUN smart wallet — the approve spender.
+        let spender = parse_addr(txs[0]["to"].as_str().ok_or("railgun: shield tx missing `to`")?)?;
+
+        let from = p.from.clone();
+        let mut nonce = parse_hex_u64(
+            ok_value(modules().eth_rpc_module.get_transaction_count(chain_id, &from).map_err(|e| e.to_string())?)?
+                ["result"].as_str().unwrap_or("0x0"),
+        );
+
+        // 2) approve(spender, amount) on the ERC-20.
+        let approve_data = txbuild::erc20_approve_calldata(spender, amount);
+        let approve_hash = self.sign_and_broadcast_call(&from, chain_id, asset, U256::ZERO, &approve_data, nonce, 90_000)?;
+        nonce += 1;
+
+        // 3) each shield TxData (queued behind the approve via sequential nonces).
+        let mut last_hash = approve_hash.clone();
+        for tx in &txs {
+            let to = parse_addr(tx["to"].as_str().ok_or("railgun: shield tx missing `to`")?)?;
+            let value = parse_u256_str(tx["value"].as_str().unwrap_or("0x0"));
+            let data = hex::decode(tx["data"].as_str().unwrap_or("").trim_start_matches("0x"))
+                .map_err(|e| format!("railgun: bad shield calldata: {e}"))?;
+            last_hash = self.sign_and_broadcast_call(&from, chain_id, to, value, &data, nonce, 300_000)?;
+            nonce += 1;
+        }
+
+        // 4) record + notify (the shield tx is the user-facing one).
+        let record = TxRecord {
+            hash: last_hash.clone(),
+            chain_id: chain_id as u64,
+            from: from.clone(),
+            to: format!("{spender}"),
+            value: amount.to_string(),
+            kind: "shield".into(),
+            token: Some(p.asset.clone()),
+            status: "pending".into(),
+            timestamp: now_secs(),
+        };
+        if let Ok(st) = self.st() {
+            st.history.add(&from, record);
+        }
+        emit_tx_status_changed(&last_hash);
+        Ok(json!({ "ok": true, "hash": last_hash, "approveHash": approve_hash }))
     }
 }
 
@@ -893,6 +1050,107 @@ impl WalletBackendModule for WalletBackendModuleImpl {
             Ok(v) => v.to_string(),
             Err(e) => err(e),
         }
+    }
+
+    // ── private (RAILGUN) ──────────────────────────────────────────────────────
+
+    fn init_private(&mut self, address: String, chain_id: i64) -> String {
+        // Deterministic EOA signature → seed for railgun's key derivation. The
+        // signature never persists here; railgun derives + holds the actual keys.
+        let sig = match ok_value(
+            match modules().keystore_module.sign_message(&address, RAILGUN_SEED_MSG) {
+                Ok(s) => s,
+                Err(e) => return err(e),
+            },
+        ) {
+            Ok(v) => v,
+            Err(e) => return err(format!("derive seed: {e}")),
+        };
+        let seed = match sig["signature"].as_str() {
+            Some(s) => s.to_string(),
+            None => return err("keystore: no signature"),
+        };
+        let params = json!({ "chainId": chain_id, "seed": seed, "poi": false }).to_string();
+        match modules().railgun_module.init_from_seed(&params) {
+            Ok(s) => s, // `{ ok, address: "0zk…" }`
+            Err(e) => err(e),
+        }
+    }
+
+    fn get_zk_address(&mut self) -> String {
+        match modules().railgun_module.get_zk_address() {
+            Ok(s) => s,
+            Err(e) => err(e),
+        }
+    }
+
+    fn sync_private(&mut self) -> String {
+        match modules().railgun_module.sync() {
+            Ok(s) => s,
+            Err(e) => err(e),
+        }
+    }
+
+    fn get_shielded_balance(&mut self) -> String {
+        match modules().railgun_module.get_shielded_balance() {
+            Ok(s) => s,
+            Err(e) => err(e),
+        }
+    }
+
+    fn shield(&mut self, send_json: String) -> String {
+        let p: ShieldParams = match serde_json::from_str(&send_json) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        match self.do_shield(&p) {
+            Ok(v) => v.to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn private_send(&mut self, send_json: String) -> String {
+        let p: PrivateSendParams = match serde_json::from_str(&send_json) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        // railgun routes 0zk→transfer / 0x→unshield and builds+signs+submits the
+        // 4337 UserOp (sender hidden). Returns `{ ok, userOpHash }`.
+        let params = json!({
+            "to": p.to,
+            "asset": p.asset,
+            "amount": parse_u256_str(&p.amount).to_string(),
+            "memo": p.memo,
+            "owner": p.from,
+            "bundlerUrl": p.bundler_url,
+        })
+        .to_string();
+        let res = match ok_value(match modules().railgun_module.relayed_send(&params) {
+            Ok(s) => s,
+            Err(e) => return err(e),
+        }) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        let user_op_hash = res["userOpHash"].as_str().unwrap_or("").to_string();
+        // Record as a pending private tx (kind by recipient form).
+        let kind = if p.to.starts_with("0zk") { "private_transfer" } else { "unshield" };
+        let record = TxRecord {
+            hash: user_op_hash.clone(),
+            chain_id: p.chain_id as u64,
+            from: p.from.clone(),
+            to: p.to.clone(),
+            value: parse_u256_str(&p.amount).to_string(),
+            kind: kind.into(),
+            token: Some(p.asset.clone()),
+            status: "pending".into(),
+            timestamp: now_secs(),
+        };
+        if let Ok(st) = self.st() {
+            st.history.add(&p.from, record);
+        }
+        emit_tx_status_changed(&user_op_hash);
+        json!({ "ok": true, "userOpHash": user_op_hash }).to_string()
     }
 
     fn get_history(&mut self, address: String) -> String {

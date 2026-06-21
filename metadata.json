@@ -7,7 +7,7 @@
   "interface": "cdylib",
   "category": "wallet",
   "main": "wallet_backend_module_plugin",
-  "dependencies": ["eth_rpc_module", "keystore_module", "token_list_module", "uniswap_module"],
+  "dependencies": ["eth_rpc_module", "keystore_module", "token_list_module", "uniswap_module", "railgun_module"],
   "include": [],
   "capabilities": [],
   "codegen": {
