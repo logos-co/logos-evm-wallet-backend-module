@@ -95,6 +95,13 @@ sections:
             --override-input logos-module-builder/logos-rust-sdk 'github:logos-co/logos-rust-sdk{release}' \
             --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
             --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol{release}'
+      - title: "Build railgun_module (.lgx) — private transactions"
+        run: |
+          nix build 'github:logos-co/logos-evm-railgun-module{release}#lgx' --no-write-lock-file -o railgun-lgx \
+            --override-input logos-module-builder 'github:logos-co/logos-module-builder{release}' \
+            --override-input logos-module-builder/logos-rust-sdk 'github:logos-co/logos-rust-sdk{release}' \
+            --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk{release}' \
+            --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol{release}'
       - title: "Build wallet_backend_module (.lgx) — the fan-out coordinator"
         run: |
           nix build 'github:logos-co/logos-evm-wallet-backend-module{release}#lgx' --no-write-lock-file -o wallet-backend-lgx \
@@ -113,9 +120,9 @@ sections:
           mkdir -p modules
           cp -RL ./logos/modules/. ./modules/
         check_file: "modules/capability_module/manifest.json"
-      - title: "Install all five .lgx with lgpm"
+      - title: "Install all six .lgx with lgpm"
         run: |
-          for f in eth-rpc-lgx keystore-lgx token-list-lgx uniswap-lgx wallet-backend-lgx; do
+          for f in eth-rpc-lgx keystore-lgx token-list-lgx uniswap-lgx railgun-lgx wallet-backend-lgx; do
             ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file "$f"/*.lgx
           done
         expect_contains:
