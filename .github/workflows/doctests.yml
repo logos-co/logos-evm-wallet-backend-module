@@ -33,7 +33,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    timeout-minutes: 110
 
     steps:
       - name: Checkout
@@ -66,6 +66,7 @@ jobs:
         run: |
           nix run github:logos-co/logos-doctest -- run \
             doctests/wallet-backend-runtime.test.yaml \
+            doctests/wallet-anvil-e2e.test.yaml \
             --verbose \
             --continue-on-fail \
             --release-for logos-evm-wallet-backend-module=${{ steps.commit.outputs.sha }} \
