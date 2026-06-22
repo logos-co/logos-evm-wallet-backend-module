@@ -156,7 +156,7 @@ sections:
       reserves: **1 TKN = 0.01 ETH** and **1 WETH = 3000 USDC**.
     steps:
       - title: "Start Anvil"
-        run: "sh -c './foundry/bin/anvil --chain-id 11155111 --port 8545 --silent > anvil.log 2>&1 &'"
+        run: "sh -c './foundry/bin/anvil --chain-id 11155111 --port 8545 --silent > anvil.log 2>&1 & echo $! > anvil.pid'"
         code_block: "anvil --chain-id 11155111 --port 8545 &"
       - run: "sleep 3"
       - title: "Write the mock contracts"
@@ -427,9 +427,12 @@ sections:
     steps:
       - title: "Stop the daemon and Anvil"
         run: |
-          trap '' TERM
           ./logos/bin/logoscore stop || true
-          pkill -f anvil 2>/dev/null || true
+          # Stop the local chain by PID (captured at start), NOT by a pattern: a
+          # pattern-based kill (pkill -f) would also match this step's own shell
+          # and the doctest runner whose argv contains this spec's path, killing
+          # the run mid-shutdown.
+          kill "$(cat anvil.pid 2>/dev/null)" 2>/dev/null || true
           true
       - run: "sleep 2"
       - title: "Confirm the daemon has stopped"
