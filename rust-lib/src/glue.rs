@@ -32,8 +32,11 @@ pub trait WalletBackendModule: Send + 'static {
     fn create_account(&mut self, passphrase: String, label: String) -> String;
     fn import_mnemonic(&mut self, phrase_json: String, label: String) -> String;
     fn list_accounts(&mut self) -> String;
-    fn unlock(&mut self, address: String, passphrase: String) -> bool;
-    fn lock(&mut self, address: String) -> bool;
+    /// Drive a parked signing request forward: `{ ok, state, hash?, reason? }`.
+    /// `state` is `awaiting_approval` until a human decides. There is no
+    /// `unlock`/`lock` any more — the wallet never handles a vault password,
+    /// and there is no unlocked state for it to toggle.
+    fn send_status(&mut self, request_id: String) -> String;
 
     // ── watched tokens ──
     fn set_watched_tokens(&mut self, chain_id: i64, addresses_json: String) -> bool;
@@ -119,6 +122,38 @@ struct State {
     /// chainId -> (token address -> (eth, usd)) prices — populated by the
     /// `refresh_market` fan-out, read by `get_market`. Ephemeral (not persisted).
     market_prices: Arc<Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>>>>,
+    /// Signing requests awaiting a human. Keyed by the keystore approval
+    /// handle. Nothing here blocks a dispatch: a request returns immediately
+    /// and the UI drives it forward with `send_status`.
+    jobs: std::collections::HashMap<String, PendingJob>,
+}
+
+/// What to do with the signatures once a human approves them.
+enum PendingJob {
+    /// One transaction: broadcast it and record it.
+    Send { chain_id: u64, receipt: String, record: TxRecord },
+    /// An ERC-20 approve followed by N shield calls, all pre-built, all
+    /// approved as ONE human decision. Broadcast in order.
+    Shield { chain_id: u64, receipt: String, record: TxRecord },
+    /// The RAILGUN seed signature. The signature IS private key material — it
+    /// is handed straight to railgun and never recorded or logged.
+    SeedDerive { receipt: String, chain_id: i64 },
+}
+
+/// Ask the keystore for a human approval over `legs`. Returns the handle to
+/// poll. This never waits for the human: keystore answers in microseconds and
+/// the decision arrives later, so no dispatch thread is ever parked on a person.
+fn request_signing(address: &str, purpose: &str, legs: Vec<Value>) -> std::result::Result<(String, String), String> {
+    let intent = json!({ "address": address, "purpose": purpose, "legs": legs }).to_string();
+    let resp = ok_value(modules().keystore_module.request_approval(&intent).map_err(|e| e.to_string())?)?;
+    let handle = resp["handle"].as_str().ok_or("keystore: no handle")?.to_string();
+    let receipt = resp["receipt"].as_str().ok_or("keystore: no receipt")?.to_string();
+    Ok((handle, receipt))
+}
+
+/// One `tx` leg of an approval intent.
+fn tx_leg(chain_id: u64, unsigned: &Value) -> Value {
+    json!({ "kind": "tx", "chain_id": chain_id, "tx": unsigned })
 }
 
 // ── small helpers ────────────────────────────────────────────────────────────
@@ -580,23 +615,17 @@ impl WalletBackendModuleImpl {
             None => txbuild::unsigned_native_tx(to_addr, parse_u256_str(&p.amount), nonce, gas_limit, &fee),
         };
 
-        // sign (keystore) → broadcast (eth_rpc)
-        let signed = ok_value(
-            modules().keystore_module.sign_transaction(&from, &unsigned.to_string(), chain_id as i64).map_err(|e| e.to_string())?,
-        )?;
-        let raw = signed["raw"].as_str().ok_or("keystore: no raw tx")?.to_string();
-        let bcast = ok_value(
-            modules().eth_rpc_module.send_raw_transaction(chain_id as i64, &raw).map_err(|e| e.to_string())?,
-        )?;
-        let hash = bcast["hash"].as_str().ok_or("broadcast: no hash")?.to_string();
+        // Ask a human. Nothing is signed or broadcast here; the hash does not
+        // exist yet, so the caller gets a request id and polls `send_status`.
+        let (handle, receipt) = request_signing(&from, "send", vec![tx_leg(chain_id, &unsigned)])?;
 
-        // record + notify
         let (kind, token, value) = match &erc20 {
             Some((token, amount)) => ("erc20", Some(format!("{token}")), amount.to_string()),
             None => ("native", None, parse_u256_str(&p.amount).to_string()),
         };
         let record = TxRecord {
-            hash: hash.clone(),
+            // Filled in when the signature comes back and is broadcast.
+            hash: String::new(),
             chain_id,
             from: from.clone(),
             to: p.to.clone(),
@@ -606,17 +635,95 @@ impl WalletBackendModuleImpl {
             status: "pending".into(),
             timestamp: now_secs(),
         };
-        if let Ok(st) = self.st() {
-            st.history.add(&from, record);
-        }
-        emit_tx_status_changed(&hash);
-        Ok(json!({ "ok": true, "hash": hash }))
+        // Park the job. History is written when the tx is actually broadcast —
+        // recording it now would show the user a transaction they have not yet
+        // approved.
+        self.st()?
+            .jobs
+            .insert(handle.clone(), PendingJob::Send { chain_id: chain_id as u64, receipt, record });
+        Ok(json!({ "ok": true, "pending": true, "requestId": handle }))
     }
 
-    /// Build (gas from eth_rpc) → sign (keystore) → broadcast (eth_rpc) a pre-built
-    /// `(to, value, data)` call at `nonce`. Returns the tx hash. Shared by the
-    /// RAILGUN shield path (an `approve` then the shield `TxData`).
-    fn sign_and_broadcast_call(
+    /// Drive a parked job forward. Returns the same shape whatever the job was:
+    /// `{ ok, state, hash?, reason? }`. Safe to call repeatedly.
+    fn job_status(&mut self, request_id: &str) -> std::result::Result<Value, String> {
+        let receipt = match self.st()?.jobs.get(request_id) {
+            Some(PendingJob::Send { receipt, .. })
+            | Some(PendingJob::Shield { receipt, .. })
+            | Some(PendingJob::SeedDerive { receipt, .. }) => receipt.clone(),
+            None => return Err("unknown request".into()),
+        };
+
+        let st = ok_value(
+            modules().keystore_module.approval_status(request_id, &receipt).map_err(|e| e.to_string())?,
+        )?;
+        match st["state"].as_str().unwrap_or("") {
+            "offered" | "rendered" => {
+                return Ok(json!({ "ok": true, "state": "awaiting_approval" }))
+            }
+            "settled" => {}
+            other => return Err(format!("unexpected approval state {other:?}")),
+        }
+        if st["reason"].as_str() != Some("approved") {
+            let reason = st["reason"].as_str().unwrap_or("settled").to_string();
+            self.st()?.jobs.remove(request_id);
+            return Ok(json!({ "ok": true, "state": "declined", "reason": reason }));
+        }
+
+        // Approved: collect the signatures, then act on them.
+        let fetched = ok_value(
+            modules().keystore_module.fetch_result(request_id, &receipt).map_err(|e| e.to_string())?,
+        )?;
+        let sigs: Vec<String> = fetched["results"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        if sigs.is_empty() {
+            return Err("keystore: approval produced no signatures".into());
+        }
+
+        let job = self.st()?.jobs.remove(request_id).ok_or("unknown request")?;
+        let out = match job {
+            PendingJob::Send { chain_id, mut record, .. }
+            | PendingJob::Shield { chain_id, mut record, .. } => {
+                // Broadcast in order; the LAST hash is the user-facing one.
+                let mut last = String::new();
+                for raw in &sigs {
+                    let bcast = ok_value(
+                        modules()
+                            .eth_rpc_module
+                            .send_raw_transaction(chain_id as i64, raw)
+                            .map_err(|e| e.to_string())?,
+                    )?;
+                    last = bcast["hash"].as_str().ok_or("broadcast: no hash")?.to_string();
+                }
+                record.hash = last.clone();
+                let from = record.from.clone();
+                if let Ok(state) = self.st() {
+                    state.history.add(&from, record);
+                }
+                emit_tx_status_changed(&last);
+                json!({ "ok": true, "state": "done", "hash": last })
+            }
+            PendingJob::SeedDerive { chain_id, .. } => {
+                // The signature is spending-key material: straight to railgun,
+                // never recorded, never logged, never returned to the caller.
+                let params = json!({ "chainId": chain_id, "seed": sigs[0], "poi": false }).to_string();
+                let res = modules().railgun_module.init_from_seed(&params).map_err(|e| e.to_string())?;
+                let v = ok_value(res)?;
+                json!({ "ok": true, "state": "done", "railgunAddress": v["address"] })
+            }
+        };
+        // Tell the keystore we have them so it can wipe its copy.
+        let _ = modules().keystore_module.ack_result(request_id, &receipt);
+        Ok(out)
+    }
+
+    /// Build the UNSIGNED tx for a pre-built `(to, value, data)` call at
+    /// `nonce`, estimating gas via eth_rpc. Nothing is signed or broadcast:
+    /// the result becomes one leg of an approval bundle. Shared by the RAILGUN
+    /// shield path (an `approve` then each shield `TxData`).
+    fn build_call_leg(
         &self,
         from: &str,
         chain_id: i64,
@@ -625,7 +732,7 @@ impl WalletBackendModuleImpl {
         data: &[u8],
         nonce: u64,
         default_gas: u64,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<Value, String> {
         let gas_price = parse_u256_str(
             ok_value(modules().eth_rpc_module.gas_price(chain_id).map_err(|e| e.to_string())?)?
                 ["result"].as_str().unwrap_or("0x0"),
@@ -645,15 +752,7 @@ impl WalletBackendModuleImpl {
             Ok(s) => ok_value(s).ok().and_then(|v| v["result"].as_str().map(parse_hex_u64)).unwrap_or(default_gas),
             Err(_) => default_gas,
         };
-        let unsigned = txbuild::unsigned_call_tx(to, value, data, nonce, gas_limit, &fee);
-        let signed = ok_value(
-            modules().keystore_module.sign_transaction(from, &unsigned.to_string(), chain_id).map_err(|e| e.to_string())?,
-        )?;
-        let raw = signed["raw"].as_str().ok_or("keystore: no raw tx")?.to_string();
-        let bcast = ok_value(
-            modules().eth_rpc_module.send_raw_transaction(chain_id, &raw).map_err(|e| e.to_string())?,
-        )?;
-        Ok(bcast["hash"].as_str().ok_or("broadcast: no hash")?.to_string())
+        Ok(txbuild::unsigned_call_tx(to, value, data, nonce, gas_limit, &fee))
     }
 
     /// SHIELD coordinator: prepare the shield TxData from `railgun_module`, approve
@@ -681,25 +780,37 @@ impl WalletBackendModuleImpl {
                 ["result"].as_str().unwrap_or("0x0"),
         );
 
-        // 2) approve(spender, amount) on the ERC-20.
+        // 2) Build EVERY leg up front — the ERC-20 approve, then each shield
+        //    call, queued behind it by sequential nonces. Nothing is signed
+        //    here.
+        let mut legs = Vec::with_capacity(txs.len() + 1);
         let approve_data = txbuild::erc20_approve_calldata(spender, amount);
-        let approve_hash = self.sign_and_broadcast_call(&from, chain_id, asset, U256::ZERO, &approve_data, nonce, 90_000)?;
+        legs.push(tx_leg(
+            chain_id as u64,
+            &self.build_call_leg(&from, chain_id, asset, U256::ZERO, &approve_data, nonce, 90_000)?,
+        ));
         nonce += 1;
 
-        // 3) each shield TxData (queued behind the approve via sequential nonces).
-        let mut last_hash = approve_hash.clone();
         for tx in &txs {
             let to = parse_addr(tx["to"].as_str().ok_or("railgun: shield tx missing `to`")?)?;
             let value = parse_u256_str(tx["value"].as_str().unwrap_or("0x0"));
             let data = hex::decode(tx["data"].as_str().unwrap_or("").trim_start_matches("0x"))
                 .map_err(|e| format!("railgun: bad shield calldata: {e}"))?;
-            last_hash = self.sign_and_broadcast_call(&from, chain_id, to, value, &data, nonce, 300_000)?;
+            legs.push(tx_leg(
+                chain_id as u64,
+                &self.build_call_leg(&from, chain_id, to, value, &data, nonce, 300_000)?,
+            ));
             nonce += 1;
         }
 
+        // 3) ONE human decision covering the approve and every shield call —
+        //    the whole point of a bundle. The nonces are inside the commitment,
+        //    so the approval is bound to this exact sequence.
+        let (handle, receipt) = request_signing(&from, "shield", legs)?;
+
         // 4) record + notify (the shield tx is the user-facing one).
         let record = TxRecord {
-            hash: last_hash.clone(),
+            hash: String::new(),
             chain_id: chain_id as u64,
             from: from.clone(),
             to: format!("{spender}"),
@@ -709,11 +820,10 @@ impl WalletBackendModuleImpl {
             status: "pending".into(),
             timestamp: now_secs(),
         };
-        if let Ok(st) = self.st() {
-            st.history.add(&from, record);
-        }
-        emit_tx_status_changed(&last_hash);
-        Ok(json!({ "ok": true, "hash": last_hash, "approveHash": approve_hash }))
+        self.st()?
+            .jobs
+            .insert(handle.clone(), PendingJob::Shield { chain_id: chain_id as u64, receipt, record });
+        Ok(json!({ "ok": true, "pending": true, "requestId": handle }))
     }
 }
 
@@ -733,7 +843,7 @@ impl WalletBackendModule for WalletBackendModuleImpl {
                 .unwrap_or_default(),
         ));
         let market_prices = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let st = State { cfg, history, dir, watched, balances, market_prices };
+        let st = State { cfg, history, dir, watched, balances, market_prices, jobs: Default::default() };
         Self::push_chain_configs(&st);
         self.state = Some(st);
     }
@@ -810,14 +920,6 @@ impl WalletBackendModule for WalletBackendModuleImpl {
             Ok(s) => s,
             Err(e) => err(e),
         }
-    }
-
-    fn unlock(&mut self, address: String, passphrase: String) -> bool {
-        modules().keystore_module.unlock(&address, &passphrase).unwrap_or(false)
-    }
-
-    fn lock(&mut self, address: String) -> bool {
-        modules().keystore_module.lock(&address).unwrap_or(false)
     }
 
     fn set_watched_tokens(&mut self, chain_id: i64, addresses_json: String) -> bool {
@@ -1055,24 +1157,26 @@ impl WalletBackendModule for WalletBackendModuleImpl {
     // ── private (RAILGUN) ──────────────────────────────────────────────────────
 
     fn init_private(&mut self, address: String, chain_id: i64) -> String {
-        // Deterministic EOA signature → seed for railgun's key derivation. The
-        // signature never persists here; railgun derives + holds the actual keys.
-        let sig = match ok_value(
-            match modules().keystore_module.sign_message(&address, RAILGUN_SEED_MSG) {
-                Ok(s) => s,
-                Err(e) => return err(e),
-            },
-        ) {
+        // The signature over RAILGUN_SEED_MSG IS the private spending key
+        // material — this is not an ordinary "sign a message". It goes through
+        // the same human approval as anything else, and the render says so.
+        let leg = json!({ "kind": "message", "text": RAILGUN_SEED_MSG });
+        let (handle, receipt) = match request_signing(&address, "derive private-wallet keys", vec![leg]) {
             Ok(v) => v,
-            Err(e) => return err(format!("derive seed: {e}")),
+            Err(e) => return err(e),
         };
-        let seed = match sig["signature"].as_str() {
-            Some(s) => s.to_string(),
-            None => return err("keystore: no signature"),
-        };
-        let params = json!({ "chainId": chain_id, "seed": seed, "poi": false }).to_string();
-        match modules().railgun_module.init_from_seed(&params) {
-            Ok(s) => s, // `{ ok, address: "0zk…" }`
+        if let Err(e) = self
+            .st()
+            .map(|st| st.jobs.insert(handle.clone(), PendingJob::SeedDerive { receipt, chain_id }))
+        {
+            return err(e);
+        }
+        json!({ "ok": true, "pending": true, "requestId": handle }).to_string()
+    }
+
+    fn send_status(&mut self, request_id: String) -> String {
+        match self.job_status(&request_id) {
+            Ok(v) => v.to_string(),
             Err(e) => err(e),
         }
     }
