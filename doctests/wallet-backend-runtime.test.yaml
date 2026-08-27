@@ -191,32 +191,84 @@ sections:
           printf '%s\n' "$out"
         expect_contains:
           - "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
-      - title: "Unlock the account"
-        run: "./logos/bin/logoscore call wallet_backend_module unlock f39fd6e51aad88f6f4ce6ab8827279cfffb92266 pw"
-        code_block: "logoscore call wallet_backend_module unlock <address> pw"
-        expect_contains:
-          - "true"
-      - title: "Send a native transfer (build → sign → broadcast → record)"
+      - title: "There is no unlock, and no way to sign"
         text: |
-          The coordinator fetches the nonce and gas price from eth-rpc, estimates
-          gas, builds the unsigned EIP-1559 tx (alloy), signs it via the keystore,
-          broadcasts it via eth-rpc (the mock returns a fixed hash), and records it.
-        run: "./logos/bin/logoscore call wallet_backend_module send_native @send.json"
+          The wallet used to unlock an account and then sign with it for as long
+          as the process lived. Both `unlock` and `lock` are gone, and the
+          keystore has no `sign_*` for this module to call either. The daemon
+          lists what a module exposes when asked for a method it does not have,
+          so the removal can be asserted directly rather than implied.
+        run: |
+          out=$(./logos/bin/logoscore call wallet_backend_module unlock 2>&1 || true)
+          printf '%s\n' "$out"
+          case "$out" in
+            *'"unlock"'*) echo "GONE=no  (unlock is still exposed)" ;;
+            *)            echo "GONE=yes (no unlock in available_methods)" ;;
+          esac
+        code_block: "logoscore call wallet_backend_module unlock <address> pw   # no such method"
+        expect_contains:
+          - "GONE=yes"
+      - title: "A send is now a REQUEST, and returns no hash"
+        text: |
+          The coordinator still fetches the nonce and gas price from eth-rpc,
+          estimates gas and builds the unsigned EIP-1559 tx (alloy) — then stops.
+          It calls `request_approval`, parks the job and answers immediately with
+          a request id. There is no hash to return: nothing has been signed, so
+          nothing has been broadcast.
+        run: |
+          # The daemon returns the module's JSON as an ESCAPED string inside its
+          # own envelope ("result":"{\"ok\":true,...}"), so unescape once here
+          # and assert on clean JSON. Matching the raw form is how a guard ends
+          # up vacuous: `case $out in *'"hash":"0x'*)` can never fire against
+          # \"hash\":\"0x, so it would report "not signed" even if it were.
+          out=$(./logos/bin/logoscore call wallet_backend_module send_native @send.json 2>&1 | sed 's/\\"/"/g')
+          printf '%s\n' "$out"
+          case "$out" in
+            *abababab*) echo "SIGNED_WITHOUT_APPROVAL=yes" ;;
+            *)          echo "SIGNED_WITHOUT_APPROVAL=no" ;;
+          esac
         code_block: "logoscore call wallet_backend_module send_native @send.json"
         expect_contains:
-          - "hash"
-          - "abababab"
-      - title: "The transaction is in local history"
+          - '"pending":true'
+          - "requestId"
+          - "SIGNED_WITHOUT_APPROVAL=no"
+      - title: "It is waiting for a human, not for the chain"
+        text: |
+          `send_status` reports where the request actually is. No approver runs
+          in this daemon — Tier A admits `module:signer_ui` and nothing else, and
+          a `logoscore` caller is refused there by design — so the request stays
+          parked. That is the point: the wallet cannot advance it alone.
+        run: |
+          out=$(./logos/bin/logoscore call wallet_backend_module send_native @send.json 2>&1 | sed 's/\\"/"/g')
+          rid=$(printf '%s' "$out" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p')
+          printf 'requestId=%s\n' "$rid"
+          ./logos/bin/logoscore call wallet_backend_module send_status "$rid" 2>&1 | sed 's/\\"/"/g' || true
+        code_block: "logoscore call wallet_backend_module send_status <requestId>"
+        expect_contains:
+          - "awaiting_approval"
+      - title: "Nothing was broadcast, so history has no hash"
+        text: |
+          History is written when a transaction is BROADCAST, not when it is
+          requested. Recording at request time would show the user a transaction
+          they had not approved, carrying a hash that does not exist.
+
+          The full approved path — request, render, vault password, signature —
+          is proven end to end in `logos-evm-signer-ui`'s own doc-test, which
+          runs an approver. This spec deliberately proves the other half: that
+          without one, nothing is signed.
         run: |
           for i in 1 2 3 4 5 6; do
-            out=$(./logos/bin/logoscore call wallet_backend_module get_history f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1)
+            out=$(./logos/bin/logoscore call wallet_backend_module get_history f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1 | sed 's/\\"/"/g')
             case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
           done
           printf '%s\n' "$out"
+          case "$out" in
+            *abababab*) echo "BROADCAST_WITHOUT_APPROVAL=yes" ;;
+            *)          echo "BROADCAST_WITHOUT_APPROVAL=no" ;;
+          esac
         code_block: "logoscore call wallet_backend_module get_history <address>"
         expect_contains:
-          - "abababab"
-          - "pending"
+          - "BROADCAST_WITHOUT_APPROVAL=no"
       - title: "Stop the daemon and the mock node"
         run: |
           trap '' TERM
