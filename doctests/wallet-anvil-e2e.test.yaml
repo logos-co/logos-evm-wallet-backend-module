@@ -298,11 +298,22 @@ sections:
         expect_contains:
           - "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
           - '\"ok\":true'
-      - title: "Unlock it"
-        run: "./logos/bin/logoscore call wallet_backend_module unlock f39fd6e51aad88f6f4ce6ab8827279cfffb92266 pw"
-        code_block: "logoscore call wallet_backend_module unlock <address> pw"
+      - title: "There is nothing to unlock"
+        text: |
+          Importing an account no longer grants the wallet the ability to sign
+          with it. `unlock`/`lock` are gone from this module and the keystore has
+          no `sign_*` for it to call, so an imported account is an address the
+          wallet knows about and nothing more.
+        run: |
+          out=$(./logos/bin/logoscore call wallet_backend_module unlock 2>&1 || true)
+          printf '%s\n' "$out"
+          case "$out" in
+            *'"unlock"'*) echo "GONE=no  (unlock is still exposed)" ;;
+            *)            echo "GONE=yes (no unlock in available_methods)" ;;
+          esac
+        code_block: "logoscore call wallet_backend_module unlock <address> pw   # no such method"
         expect_contains:
-          - '"result":true'
+          - "GONE=yes"
       - title: "List accounts"
         run: "./logos/bin/logoscore call wallet_backend_module list_accounts"
         expect_contains:
@@ -377,50 +388,95 @@ sections:
         code_block: "logoscore call wallet_backend_module estimate_fee @send.json"
         expect_contains:
           - '\"gasLimit\":21000'
-      - title: "Send 1 ETH (real signed tx, mined by Anvil)"
-        run: "./logos/bin/logoscore call wallet_backend_module send_native @send.json"
+      - title: "Send 1 ETH — parked for a human, not mined"
+        text: |
+          ⚠️ **This section lost coverage deliberately, and it is worth naming.**
+          It used to prove that a real, signed EIP-1559 transaction was accepted
+          and mined by Anvil. It cannot prove that any more: the wallet has no
+          key and no `sign_*` to call, so nothing reaches the chain without an
+          approver, and Tier A admits only `module:signer_ui` — a `logoscore`
+          caller is refused there by design.
+
+          Everything up to the signature is still exercised against a real
+          chain — nonce, gas price, gas estimation, the built tx. What is no
+          longer exercised here is broadcast and mining. The approved path is
+          proven end to end in `logos-evm-signer-ui`'s doc-test, which runs an
+          approver; restoring real-chain mining *here* means running one in this
+          spec too, which is a follow-up rather than a deletion.
+        run: |
+          out=$(./logos/bin/logoscore call wallet_backend_module send_native @send.json 2>&1 | sed 's/\\"/"/g')
+          printf '%s\n' "$out"
+          case "$out" in
+            *'"hash":"0x'*) echo "MINED_WITHOUT_APPROVAL=yes" ;;
+            *)              echo "MINED_WITHOUT_APPROVAL=no" ;;
+          esac
         code_block: "logoscore call wallet_backend_module send_native @send.json"
         expect_contains:
-          - '\"hash\":\"0x'
-          - '\"ok\":true'
-      - run: "sleep 3"
-      - title: "Send 1000 TKN (real ERC-20 transfer)"
-        run: "./logos/bin/logoscore call wallet_backend_module send_erc20 @senderc20.json"
+          - '"pending":true'
+          - "requestId"
+          - "MINED_WITHOUT_APPROVAL=no"
+      - title: "Send 1000 TKN — likewise parked"
+        run: |
+          out=$(./logos/bin/logoscore call wallet_backend_module send_erc20 @senderc20.json 2>&1 | sed 's/\\"/"/g')
+          printf '%s\n' "$out"
+          case "$out" in
+            *'"hash":"0x'*) echo "MINED_WITHOUT_APPROVAL=yes" ;;
+            *)              echo "MINED_WITHOUT_APPROVAL=no" ;;
+          esac
         code_block: "logoscore call wallet_backend_module send_erc20 @senderc20.json"
         expect_contains:
-          - '\"hash\":\"0x'
-          - '\"ok\":true'
+          - '"pending":true'
+          - "MINED_WITHOUT_APPROVAL=no"
       - run: "sleep 3"
 
   - title: "History: the sends are recorded"
     step: true
     steps:
-      - title: "Read the transaction history"
-        run: "./logos/bin/logoscore call wallet_backend_module get_history f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+      - title: "History records a BROADCAST, so it is still empty"
+        text: |
+          History is written when a transaction is broadcast, never when it is
+          requested — recording at request time would show the user a transaction
+          they had not approved, carrying a hash that does not exist. Both sends
+          above are parked awaiting a human, so neither appears here.
+        run: |
+          out=$(./logos/bin/logoscore call wallet_backend_module get_history f39fd6e51aad88f6f4ce6ab8827279cfffb92266 2>&1 | sed 's/\\"/"/g')
+          printf '%s\n' "$out"
+          case "$out" in
+            *'"hash":"0x'*) echo "RECORDED_UNAPPROVED=yes" ;;
+            *)              echo "RECORDED_UNAPPROVED=no" ;;
+          esac
         code_block: "logoscore call wallet_backend_module get_history <address>"
         expect_contains:
-          - '\"hash\":\"0x'
-          - '\"kind\":\"native\"'
+          - "RECORDED_UNAPPROVED=no"
 
   - title: "Private: enable RAILGUN and derive the 0zk address"
     step: true
     text: |
-      `init_private` boots the RAILGUN engine for the chain and derives the private
-      `0zk…` address from the unlocked account. On-chain shield/transfer/unshield
-      need deployed RAILGUN contracts + a bundler (out of scope here); this proves
-      the private-wallet enable path and address derivation.
+      `init_private` derives the private `0zk…` address from a signature over a
+      fixed seed message — and that signature **is** the private spending key
+      material, not an ordinary "sign a message". So it goes through the same
+      human gate as a transfer: the call returns a request id, and no key is
+      derived until someone approves it.
+
+      That makes the enable path unprovable here for the same reason as the sends
+      above, and it is the right trade: a wallet that could silently derive
+      spending keys is exactly what the gate exists to prevent. On-chain
+      shield/transfer/unshield need deployed RAILGUN contracts + a bundler, which
+      were already out of scope for this spec.
     steps:
-      - title: "Enable private mode"
-        run: "./logos/bin/logoscore call wallet_backend_module init_private f39fd6e51aad88f6f4ce6ab8827279cfffb92266 11155111"
+      - title: "Enabling private mode also asks a human"
+        run: |
+          out=$(./logos/bin/logoscore call wallet_backend_module init_private f39fd6e51aad88f6f4ce6ab8827279cfffb92266 11155111 2>&1 | sed 's/\\"/"/g')
+          printf '%s\n' "$out"
+          case "$out" in
+            *0zk1*) echo "DERIVED_WITHOUT_APPROVAL=yes" ;;
+            *)      echo "DERIVED_WITHOUT_APPROVAL=no" ;;
+          esac
         code_block: "logoscore call wallet_backend_module init_private <address> 11155111"
         expect_contains:
-          - "0zk1"
-          - '\"ok\":true'
-      - title: "Read the 0zk address"
-        run: "./logos/bin/logoscore call wallet_backend_module get_zk_address"
-        code_block: "logoscore call wallet_backend_module get_zk_address"
-        expect_contains:
-          - "0zk1"
+          - '"pending":true'
+          - "requestId"
+          - "DERIVED_WITHOUT_APPROVAL=no"
 
   - title: "Shut down"
     step: true
