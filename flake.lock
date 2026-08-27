@@ -173,6 +173,29 @@
         "type": "github"
       }
     },
+    "fee_module": {
+      "inputs": {
+        "eth_rpc_module": [
+          "eth_rpc_module"
+        ],
+        "logos-module-builder": [
+          "logos-module-builder"
+        ]
+      },
+      "locked": {
+        "lastModified": 1787857798,
+        "narHash": "sha256-SlfKChhuK5mx2CbYZLyBm7YlzdI/lFSAU01g5lt4svY=",
+        "owner": "logos-co",
+        "repo": "logos-evm-fee-module",
+        "rev": "7ac89b19d107806b2189a9f7e55c1cf8b5543ae3",
+        "type": "github"
+      },
+      "original": {
+        "owner": "logos-co",
+        "repo": "logos-evm-fee-module",
+        "type": "github"
+      }
+    },
     "keystore_module": {
       "inputs": {
         "logos-module-builder": [
@@ -18146,6 +18169,7 @@
     "root": {
       "inputs": {
         "eth_rpc_module": "eth_rpc_module",
+        "fee_module": "fee_module",
         "keystore_module": "keystore_module",
         "logos-module-builder": "logos-module-builder",
         "token_list_module": "token_list_module",
