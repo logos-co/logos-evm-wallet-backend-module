@@ -8,7 +8,7 @@ intro: |
   uniswap modules and folds in the tx-builder, orchestrating the full send
   pipeline: **build → sign → broadcast → record**.
 
-  This doc-test loads **all five** modules into a `logoscore` daemon and drives
+  This doc-test loads **all six** modules into a `logoscore` daemon and drives
   the coordinator end-to-end against a **local mock JSON-RPC node** (offline,
   reproducible): it configures a chain, imports a known account, and sends a
   native transfer — watching the backend fetch the nonce/fees, build the tx, sign
@@ -37,34 +37,36 @@ sections:
         run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
         check_file: "lgpm/bin/lgpm"
 
-  - title: "Build and install all five modules"
+  - title: "Build and install all six modules"
     step: true
     text: |
       The coordinator and its four dependency modules each build to an `.lgx`.
       `logoscore`'s `load-module` does not auto-resolve dependencies, so we install
-      all five and load them explicitly below.
+      all six and load them explicitly below.
     steps:
-      - title: "Build the five .lgx packages"
+      - title: "Build the six .lgx packages"
         run: |
           nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx'        --no-write-lock-file -o eth-rpc-lgx
           nix build 'github:logos-co/logos-evm-keystore-module#lgx'       --no-write-lock-file -o keystore-lgx
           nix build 'github:logos-co/logos-evm-token-list-module#lgx'     --no-write-lock-file -o token-list-lgx
           nix build 'github:logos-co/logos-evm-uniswap-module#lgx'        --no-write-lock-file -o uniswap-lgx
+          nix build 'github:logos-co/logos-evm-fee-module#lgx'          --no-write-lock-file -o fee-lgx
           nix build 'github:logos-co/logos-evm-wallet-backend-module{release}#lgx' --no-write-lock-file -o backend-lgx
         code_block: |
           nix build 'github:logos-co/logos-evm-eth-rpc-module#lgx'        -o eth-rpc-lgx
           nix build 'github:logos-co/logos-evm-keystore-module#lgx'       -o keystore-lgx
           nix build 'github:logos-co/logos-evm-token-list-module#lgx'     -o token-list-lgx
           nix build 'github:logos-co/logos-evm-uniswap-module#lgx'        -o uniswap-lgx
+          nix build 'github:logos-co/logos-evm-fee-module#lgx'          -o fee-lgx
           nix build 'github:logos-co/logos-evm-wallet-backend-module{release}#lgx' -o backend-lgx
       - title: "Seed the capability module"
         run: |
           mkdir -p modules
           cp -RL ./logos/modules/. ./modules/
         check_file: "modules/capability_module/manifest.json"
-      - title: "Install all five .lgx"
+      - title: "Install all six .lgx"
         run: |
-          for p in eth-rpc-lgx keystore-lgx token-list-lgx uniswap-lgx backend-lgx; do
+          for p in eth-rpc-lgx keystore-lgx token-list-lgx uniswap-lgx fee-lgx backend-lgx; do
             ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file "$p"/*.lgx
           done
         expect_contains:
@@ -77,6 +79,7 @@ sections:
           - "keystore_module"
           - "token_list_module"
           - "uniswap_module"
+          - "fee_module"
 
   - title: "Start a mock JSON-RPC node"
     step: true
@@ -138,13 +141,13 @@ sections:
         run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
         code_block: "logoscore -D -m ./modules > logs.txt &"
       - run: "sleep 3"
-      - title: "Load all five modules"
+      - title: "Load all six modules"
         run: |
-          for m in eth_rpc_module keystore_module token_list_module uniswap_module wallet_backend_module; do
+          for m in eth_rpc_module keystore_module token_list_module uniswap_module fee_module wallet_backend_module; do
             ./logos/bin/logoscore load-module "$m"
           done
         code_block: |
-          for m in eth_rpc_module keystore_module token_list_module uniswap_module wallet_backend_module; do
+          for m in eth_rpc_module keystore_module token_list_module uniswap_module fee_module wallet_backend_module; do
             logoscore load-module "$m"
           done
         expect_contains:

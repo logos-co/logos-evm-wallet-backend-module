@@ -375,6 +375,18 @@ struct SendParams {
     amount: String, // wei (native) or token base units (erc20)
     #[serde(default)]
     token_address: String, // erc20 only
+
+    // Fee controls, all optional and all passed straight to fee_module. A
+    // caller that supplies both fee fields is obeyed verbatim; otherwise
+    // `tier` selects a suggestion and defaults to "normal".
+    #[serde(default)]
+    tier: Option<String>, // "slow" | "normal" | "fast"
+    #[serde(default)]
+    max_fee_per_gas: Option<String>,
+    #[serde(default)]
+    max_priority_fee_per_gas: Option<String>,
+    #[serde(default)]
+    gas_limit: Option<String>,
 }
 
 impl WalletBackendModuleImpl {
@@ -526,13 +538,24 @@ impl WalletBackendModuleImpl {
             ok_value(modules().eth_rpc_module.get_transaction_count(chain_id as i64, &from).map_err(|e| e.to_string())?)?
                 ["result"].as_str().unwrap_or("0x0"),
         );
-        let gas_price = parse_u256_str(
-            ok_value(modules().eth_rpc_module.gas_price(chain_id as i64).map_err(|e| e.to_string())?)?
-                ["result"].as_str().unwrap_or("0x0"),
-        );
+        // Fees come from fee_module, which derives the tip from eth_feeHistory.
+        // This used to be `max_fee = gas_price * 2, max_priority = gas_price` --
+        // and since eth_gasPrice is roughly baseFee + tip, that tipped
+        // approximately the whole base fee and cost exactly 2x on every send.
+        // `tier` rides in on SendParams so a UI can offer slow/normal/fast; an
+        // explicit maxFeePerGas/maxPriorityFeePerGas is passed straight through
+        // and obeyed verbatim.
+        let fee_req = json!({
+            "tier": p.tier.clone().unwrap_or_else(|| "normal".into()),
+            "maxFeePerGas": p.max_fee_per_gas.clone(),
+            "maxPriorityFeePerGas": p.max_priority_fee_per_gas.clone(),
+        });
+        let fee_reply = ok_value(
+            modules().fee_module.estimate(chain_id as i64, &fee_req.to_string()).map_err(|e| e.to_string())?,
+        )?;
         let fee = Fee::Eip1559 {
-            max_fee_per_gas: gas_price.saturating_mul(U256::from(2)),
-            max_priority_fee_per_gas: gas_price,
+            max_fee_per_gas: parse_u256_str(fee_reply["maxFeePerGas"].as_str().unwrap_or("0")),
+            max_priority_fee_per_gas: parse_u256_str(fee_reply["maxPriorityFeePerGas"].as_str().unwrap_or("0")),
         };
 
         // estimate gas against a from/to/value/data shape
@@ -933,13 +956,19 @@ impl WalletBackendModule for WalletBackendModuleImpl {
             Ok(p) => p,
             Err(e) => return err(e),
         };
-        let gas_price = match modules().eth_rpc_module.gas_price(p.chain_id as i64) {
-            Ok(s) => ok_value(s).ok().and_then(|v| v["result"].as_str().map(parse_u256_str)).unwrap_or(U256::ZERO),
-            Err(e) => return err(e),
-        };
-        let gas = if p.token_address.is_empty() { 21_000u64 } else { 90_000u64 };
-        let fee = gas_price.saturating_mul(U256::from(gas));
-        json!({ "ok": true, "gasPrice": gas_price.to_string(), "gasLimit": gas, "feeWei": fee.to_string() }).to_string()
+        // Delegated to fee_module. The gas limit was hardcoded 21_000 / 90_000
+        // here, which is right for a bare transfer and wrong for any ERC-20 that
+        // does more than move a balance.
+        let fee_req = json!({
+            "tier": p.tier.clone().unwrap_or_else(|| "normal".into()),
+            "maxFeePerGas": p.max_fee_per_gas.clone(),
+            "maxPriorityFeePerGas": p.max_priority_fee_per_gas.clone(),
+            "gasLimit": p.gas_limit.clone(),
+        });
+        match modules().fee_module.estimate(p.chain_id as i64, &fee_req.to_string()) {
+            Ok(s) => s,
+            Err(e) => err(e),
+        }
     }
 
     fn send_native(&mut self, send_json: String) -> String {
