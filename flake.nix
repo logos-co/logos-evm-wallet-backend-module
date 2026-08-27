@@ -14,6 +14,11 @@
       url = "github:logos-co/logos-evm-eth-rpc-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
     };
+    fee_module = {
+      url = "github:logos-co/logos-evm-fee-module";
+      inputs.logos-module-builder.follows = "logos-module-builder";
+      inputs.eth_rpc_module.follows = "eth_rpc_module";
+    };
     keystore_module = {
       url = "github:logos-co/logos-evm-keystore-module";
       inputs.logos-module-builder.follows = "logos-module-builder";
