@@ -119,6 +119,12 @@ sections:
         run: |
           mkdir -p modules
           cp -RL ./logos/modules/. ./modules/
+          # `cp` without -p keeps the Nix store's own 0555 directory mode, and a
+          # read-only DIRECTORY refuses every new file and every unlink (POSIX
+          # consults the parent's write bit, not the file's). That wedges any
+          # later install into this tree, and makes `rm -rf` in a teardown or a
+          # re-run fail with Permission denied.
+          chmod -R u+w ./modules
         check_file: "modules/capability_module/manifest.json"
       - title: "Install all six .lgx with lgpm"
         run: |
