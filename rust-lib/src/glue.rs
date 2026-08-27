@@ -958,13 +958,33 @@ impl WalletBackendModule for WalletBackendModuleImpl {
         };
         // Delegated to fee_module. The gas limit was hardcoded 21_000 / 90_000
         // here, which is right for a bare transfer and wrong for any ERC-20 that
-        // does more than move a balance.
-        let fee_req = json!({
+        // does more than move a balance -- so hand fee_module the actual call
+        // and let it run estimate_gas. Without a `tx` it has nothing to measure
+        // and correctly returns 0, which is how this first shipped.
+        let tx = match parse_addr(&p.to) {
+            Ok(to_addr) => {
+                if p.token_address.is_empty() {
+                    json!({ "from": p.from, "to": p.to,
+                            "value": format!("0x{:x}", parse_u256_str(&p.amount)) })
+                } else {
+                    let data = txbuild::erc20_transfer_calldata(to_addr, parse_u256_str(&p.amount));
+                    json!({ "from": p.from, "to": p.token_address,
+                            "data": format!("0x{}", hex::encode(data)) })
+                }
+            }
+            // An unparseable recipient is the caller's problem, not a reason to
+            // refuse a fee quote: fall back to no tx and report gasLimit 0.
+            Err(_) => Value::Null,
+        };
+        let mut fee_req = json!({
             "tier": p.tier.clone().unwrap_or_else(|| "normal".into()),
             "maxFeePerGas": p.max_fee_per_gas.clone(),
             "maxPriorityFeePerGas": p.max_priority_fee_per_gas.clone(),
             "gasLimit": p.gas_limit.clone(),
         });
+        if !tx.is_null() {
+            fee_req["tx"] = tx;
+        }
         match modules().fee_module.estimate(p.chain_id as i64, &fee_req.to_string()) {
             Ok(s) => s,
             Err(e) => err(e),
