@@ -18143,38 +18143,11 @@
         "type": "github"
       }
     },
-    "railgun_module": {
-      "inputs": {
-        "eth_rpc_module": [
-          "eth_rpc_module"
-        ],
-        "keystore_module": [
-          "keystore_module"
-        ],
-        "logos-module-builder": [
-          "logos-module-builder"
-        ]
-      },
-      "locked": {
-        "lastModified": 1782057123,
-        "narHash": "sha256-hLILDh4zULMMyNxumodYvRqmQg7qZQDRsBMbRFFzjdU=",
-        "owner": "logos-co",
-        "repo": "logos-evm-railgun-module",
-        "rev": "4444b22340c91b039bf422642f95c697ea81a3e0",
-        "type": "github"
-      },
-      "original": {
-        "owner": "logos-co",
-        "repo": "logos-evm-railgun-module",
-        "type": "github"
-      }
-    },
     "root": {
       "inputs": {
         "eth_rpc_module": "eth_rpc_module",
         "keystore_module": "keystore_module",
         "logos-module-builder": "logos-module-builder",
-        "railgun_module": "railgun_module",
         "token_list_module": "token_list_module",
         "uniswap_module": "uniswap_module"
       }

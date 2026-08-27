@@ -1,8 +1,9 @@
 # Full wallet end-to-end against a local Anvil chain
 
-This doc-test drives **every wallet UI functionality** end-to-end against a
-**real EVM chain** — a local [Anvil](https://book.getfoundry.sh/anvil/) node —
-through the `wallet_backend_module` API exactly as the wallet UI calls it (via
+This doc-test drives **the wallet UI's whole surface** — settings, accounts,
+balances, market, send, history — end-to-end against a **real EVM chain**, a
+local [Anvil](https://book.getfoundry.sh/anvil/) node, through the
+`wallet_backend_module` API exactly as the wallet UI calls it (via
 `logoscore`). Unlike the mock-node doc-tests, every read and write is a real
 signed transaction or a real `eth_call` against a real chain.
 
@@ -21,11 +22,11 @@ The chain is seeded with a tiny set of mock contracts (a Multicall3, three
 ERC-20s, and two settable Uniswap-V2 pools) so **Market** prices resolve locally
 with no external dependency.
 
-**What you'll build:** The full 6-module wallet stack (`eth_rpc` [multi] + `keystore` + `token_list` + `uniswap` + `railgun` + `wallet_backend`) driven through a `logoscore` daemon against a local Anvil chain with locally-deployed Multicall3 + Uniswap-V2 mock pools.
+**What you'll build:** The full 5-module wallet stack (`eth_rpc` [multi] + `keystore` + `token_list` + `uniswap` + `wallet_backend`) driven through a `logoscore` daemon against a local Anvil chain with locally-deployed Multicall3 + Uniswap-V2 mock pools.
 
 **What you'll learn:**
 
-- How the wallet backend drives settings, accounts, balances, market, send, history, and private-enable against a real chain
+- How the wallet backend drives settings, accounts, balances, market, send, and history against a real chain
 - How `refresh_balances` fans out per-chain async reads and why that path must run the completion callback off QtRO's read stack
 - How to stand up a self-contained EVM test chain (Anvil + a Multicall3 + Uniswap-V2 mock pools) with `solc` + `cast`
 
@@ -84,7 +85,7 @@ nix build nixpkgs#solc -o solc
 
 ## Step 3: Build the wallet modules as .lgx
 
-Six modules go into one `./modules` dir; `load-module wallet_backend_module`
+Five modules go into one `./modules` dir; `load-module wallet_backend_module`
 auto-resolves and loads its dependencies. The `` overrides pin the
 builder + SDKs to the commits under test — so the protocol carrying the
 completion-dispatch fix is the one exercised.
@@ -132,18 +133,7 @@ nix build 'github:logos-co/logos-evm-uniswap-module#lgx' --no-write-lock-file -o
 
 ```
 
-### 3.5 Build railgun_module (.lgx) — private transactions
-
-```bash
-nix build 'github:logos-co/logos-evm-railgun-module#lgx' --no-write-lock-file -o railgun-lgx \
-  --override-input logos-module-builder 'github:logos-co/logos-module-builder' \
-  --override-input logos-module-builder/logos-rust-sdk 'github:logos-co/logos-rust-sdk' \
-  --override-input logos-module-builder/logos-qt-sdk 'github:logos-co/logos-qt-sdk' \
-  --override-input logos-module-builder/logos-protocol 'github:logos-co/logos-protocol'
-
-```
-
-### 3.6 Build wallet_backend_module (.lgx) — the coordinator
+### 3.5 Build wallet_backend_module (.lgx) — the coordinator
 
 ```bash
 nix build 'github:logos-co/logos-evm-wallet-backend-module#lgx' --no-write-lock-file -o wallet-backend-lgx \
@@ -170,10 +160,10 @@ cp -RL ./logos/modules/. ./modules/
 
 ```
 
-### 4.2 Install all six .lgx with lgpm
+### 4.2 Install all five .lgx with lgpm
 
 ```bash
-for f in eth-rpc-lgx keystore-lgx token-list-lgx uniswap-lgx railgun-lgx wallet-backend-lgx; do
+for f in eth-rpc-lgx keystore-lgx token-list-lgx uniswap-lgx wallet-backend-lgx; do
   ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file "$f"/*.lgx
 done
 
@@ -183,12 +173,13 @@ done
 
 ## Step 5: Start a local Anvil chain and seed it
 
-Anvil runs as chain `11155111` (Sepolia's id, so the railgun module's chain
-check passes). The mock contracts deploy from a **separate funded account**
-(Anvil's account 9) so the wallet account 0 (`0xf39F…2266`) keeps its full
-pre-funded 10000 ETH for the assertions below; their addresses are captured
-from the deploy receipts. The two Uniswap-V2 pools get directly settable
-reserves: **1 TKN = 0.01 ETH** and **1 WETH = 3000 USDC**.
+Anvil runs as chain `11155111` — Sepolia's id, so the wallet is driven with
+a real public-testnet chain id rather than Anvil's default `31337`. The mock
+contracts deploy from a **separate funded account** (Anvil's account 9) so
+the wallet account 0 (`0xf39F…2266`) keeps its full pre-funded 10000 ETH for
+the assertions below; their addresses are captured from the deploy receipts.
+The two Uniswap-V2 pools get directly settable reserves: **1 TKN = 0.01 ETH**
+and **1 WETH = 3000 USDC**.
 
 ### 5.1 Start Anvil
 
@@ -475,30 +466,9 @@ logoscore call wallet_backend_module get_history <address>
 
 ---
 
-## Step 13: Private: enable RAILGUN and derive the 0zk address
+## Step 13: Shut down
 
-`init_private` boots the RAILGUN engine for the chain and derives the private
-`0zk…` address from the unlocked account. On-chain shield/transfer/unshield
-need deployed RAILGUN contracts + a bundler (out of scope here); this proves
-the private-wallet enable path and address derivation.
-
-### 13.1 Enable private mode
-
-```bash
-logoscore call wallet_backend_module init_private <address> 11155111
-```
-
-### 13.2 Read the 0zk address
-
-```bash
-logoscore call wallet_backend_module get_zk_address
-```
-
----
-
-## Step 14: Shut down
-
-### 14.1 Stop the daemon and Anvil
+### 13.1 Stop the daemon and Anvil
 
 ```bash
 trap '' TERM
@@ -512,7 +482,7 @@ true
 sleep 2
 ```
 
-### 14.2 Confirm the daemon has stopped
+### 13.2 Confirm the daemon has stopped
 
 ```bash
 ./logos/bin/logoscore status || true
