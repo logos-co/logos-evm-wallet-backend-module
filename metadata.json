@@ -7,31 +7,15 @@
   "interface": "cdylib",
   "category": "wallet",
   "main": "wallet_backend_module_plugin",
-  "dependencies": [
-    "eth_rpc_module",
-    "keystore_module",
-    "token_list_module",
-    "uniswap_module",
-    "fee_module"
-  ],
+  "dependencies": ["eth_rpc_module", "keystore_module", "token_list_module", "uniswap_module", "fee_module"],
   "include": [],
   "capabilities": [],
   "codegen": {
-    "rust": {
-      "crate": "rust-lib",
-      "trait": "WalletBackendModule",
-      "source": "src/glue.rs"
-    }
+    "rust": { "crate": "rust-lib", "trait": "WalletBackendModule", "source": "src/glue.rs" }
   },
   "nix": {
     "external_libraries": [],
-    "packages": {
-      "build": [],
-      "runtime": []
-    },
-    "cmake": {
-      "find_packages": [],
-      "extra_include_dirs": []
-    }
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
   }
 }
