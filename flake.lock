@@ -183,11 +183,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1787858892,
-        "narHash": "sha256-qiGPAV0fhlnokdQKxEGvWlTSMUq8aD0wbPDqjwDHBDc=",
+        "lastModified": 1787863097,
+        "narHash": "sha256-YFjOWOAaW7gFSMYu8gWZz0ehup1NdDf3ZtMzDyVmnYM=",
         "owner": "logos-co",
         "repo": "logos-evm-fee-module",
-        "rev": "b333a448fd252d58ea463e4387d06c7afaf4b417",
+        "rev": "f316b682c93415adafc32de7e82bb143d597f01f",
         "type": "github"
       },
       "original": {
