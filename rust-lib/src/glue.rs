@@ -29,8 +29,6 @@ pub trait WalletBackendModule: Send + 'static {
     fn test_endpoint(&mut self, chain_id: i64) -> String;
 
     // ── accounts (signing stays in the keystore) ──
-    fn create_account(&mut self, passphrase: String, label: String) -> String;
-    fn import_mnemonic(&mut self, phrase_json: String, label: String) -> String;
     fn list_accounts(&mut self) -> String;
     /// Drive a parked signing request forward: `{ ok, state, hash?, reason? }`.
     /// `state` is `awaiting_approval` until a human decides. There is no
@@ -636,7 +634,7 @@ impl WalletBackendModuleImpl {
         let fetched = ok_value(
             modules().keystore_module.fetch_result(request_id, &receipt).map_err(|e| e.to_string())?,
         )?;
-        let sigs: Vec<String> = fetched["results"]
+        let sigs: Vec<String> = fetched["signed"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
@@ -735,22 +733,6 @@ impl WalletBackendModule for WalletBackendModuleImpl {
             Ok(s) => s,
             Err(e) => err(e),
         }
-    }
-
-    fn create_account(&mut self, passphrase: String, label: String) -> String {
-        let resp = match modules().keystore_module.new_account(&passphrase) {
-            Ok(s) => s,
-            Err(e) => return err(e),
-        };
-        self.label_new_account(resp, label)
-    }
-
-    fn import_mnemonic(&mut self, phrase_json: String, label: String) -> String {
-        let resp = match modules().keystore_module.import_mnemonic(&phrase_json) {
-            Ok(s) => s,
-            Err(e) => return err(e),
-        };
-        self.label_new_account(resp, label)
     }
 
     fn list_accounts(&mut self) -> String {
@@ -1068,26 +1050,6 @@ impl WalletBackendModule for WalletBackendModuleImpl {
         }
         emit_tx_status_changed(&hash_hex);
         json!({ "ok": true, "status": status }).to_string()
-    }
-}
-
-impl WalletBackendModuleImpl {
-    /// Persist an address->label after the keystore creates/imports it.
-    fn label_new_account(&mut self, keystore_reply: String, label: String) -> String {
-        let v = match ok_value(keystore_reply.clone()) {
-            Ok(v) => v,
-            Err(e) => return err(e),
-        };
-        if let Some(addr) = v.get("address").and_then(Value::as_str) {
-            if let Ok(st) = self.st() {
-                let p = st.dir.join("labels.json");
-                let mut labels: std::collections::HashMap<String, String> =
-                    std::fs::read_to_string(&p).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-                labels.insert(addr.to_lowercase(), label);
-                let _ = std::fs::write(p, serde_json::to_string_pretty(&labels).unwrap_or_default());
-            }
-        }
-        keystore_reply
     }
 }
 
