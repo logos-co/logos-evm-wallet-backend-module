@@ -29,7 +29,6 @@ pub trait WalletBackendModule: Send + 'static {
     fn test_endpoint(&mut self, chain_id: i64) -> String;
 
     // ── accounts (signing stays in the keystore) ──
-    fn create_account(&mut self, passphrase: String, label: String) -> String;
     fn import_mnemonic(&mut self, phrase_json: String, label: String) -> String;
     fn list_accounts(&mut self) -> String;
     /// Drive a parked signing request forward: `{ ok, state, hash?, reason? }`.
@@ -735,14 +734,6 @@ impl WalletBackendModule for WalletBackendModuleImpl {
             Ok(s) => s,
             Err(e) => err(e),
         }
-    }
-
-    fn create_account(&mut self, passphrase: String, label: String) -> String {
-        let resp = match modules().keystore_module.new_account(&passphrase) {
-            Ok(s) => s,
-            Err(e) => return err(e),
-        };
-        self.label_new_account(resp, label)
     }
 
     fn import_mnemonic(&mut self, phrase_json: String, label: String) -> String {

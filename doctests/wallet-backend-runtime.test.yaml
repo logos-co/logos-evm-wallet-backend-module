@@ -184,6 +184,23 @@ sections:
         code_block: "logoscore call wallet_backend_module test_endpoint 1337"
         expect_contains:
           - "chainId"
+      - title: "Name the custodian before importing (keystore Tier D)"
+        text: |
+          Importing a key is Tier D: it belongs to the CUSTODIAN alone, and the built-in
+          default is `keystore_ui`, which this daemon does not run — so the import below
+          would be refused until someone says who holds the role.
+
+          `configure` is TOTAL: a role it does not name is held by NOBODY, not left at its
+          default. So this names both, and `approver` deliberately stays `signer_ui` —
+          no approver runs here, which is exactly what the approval steps prove.
+        file:
+          path: roles.json
+          content: |
+            { "approver": "signer_ui", "custodian": "wallet_backend_module" }
+        run: "./logos/bin/logoscore call keystore_module configure @roles.json"
+        code_block: "logoscore call keystore_module configure @roles.json"
+        expect_contains:
+          - "wallet_backend_module"
       - title: "Import a known account (backend → keystore)"
         run: "./logos/bin/logoscore call wallet_backend_module import_mnemonic @mnemonic.json main"
         code_block: "logoscore call wallet_backend_module import_mnemonic @mnemonic.json main"
