@@ -287,7 +287,6 @@ failure — the holding still shows).
 
 | This module's method | Dependency call(s) it makes |
 |---|---|
-| `create_account` | `keystore_module.new_account(passphrase)` then persists the label locally |
 | `import_mnemonic` | `keystore_module.import_mnemonic(phrase_json)` then persists the label |
 | `list_accounts` | `keystore_module.list_accounts()` (passthrough) |
 | `unlock` / `lock` | `keystore_module.unlock(address, passphrase)` / `keystore_module.lock(address)` |
@@ -364,15 +363,6 @@ Passthrough of `eth_rpc_module.verify_chain_id(chain_id)`; the success reply
 contains a `chainId` field. Errors surface as `{"ok": false, "error": ...}`.
 
 ### 4.2 Accounts (signing stays in the keystore)
-
-#### `create_account(passphrase: String, label: String) -> String`
-Create a new keystore account. Calls `keystore_module.new_account(passphrase)`,
-then persists `address → label` in `labels.json` (lowercased key). Returns the
-keystore reply verbatim (typically `{"ok": true, "address": "0x..."}`).
-
-```bash
-logoscore call wallet_backend_module create_account "my-passphrase" "savings"
-```
 
 #### `import_mnemonic(phrase_json: String, label: String) -> String`
 Import an account from a BIP-39 mnemonic. `phrase_json` is forwarded to
@@ -617,7 +607,7 @@ calldata.
 | `config.json` | `ConfigStore` | `{ chains: [ChainInfo], proxy: ProxySettings }` |
 | `watched.json` | `set_watched_tokens` | `{ "<chainId>": ["0x...", ...] }` |
 | `balances_cache.json` | `refresh_balances` completion | `{ "<address>": { address, chains: [...] } }` |
-| `labels.json` | `create_account` / `import_mnemonic` | `{ "<lowercased address>": "<label>" }` |
+| `labels.json` | `import_mnemonic` | `{ "<lowercased address>": "<label>" }` |
 | `history/<address>.json` | `History` | `[TxRecord, ...]` newest-first, address-keyed (lowercased, `0x`-stripped) |
 
 `market_prices` is **in-memory only** (ephemeral, not persisted): `chainId →

@@ -16,7 +16,7 @@ transaction history (the only history available without a proprietary indexer).
 ## Contract (`WalletBackendModule`)
 
 Config: `set_proxy_config`/`get_proxy_config`, `set_chains`/`get_chains`,
-`test_endpoint`. Accounts: `create_account`, `import_mnemonic`, `list_accounts`,
+`test_endpoint`. Accounts: `import_mnemonic`, `list_accounts`,
 `unlock`/`lock`. Watched tokens: `set_watched_tokens`/`get_watched_tokens`.
 Tokens: `get_tokens`, `add_custom_token`. Balances: `refresh_balances`,
 `get_balances`. Send: `estimate_fee`, `send_native`, `send_erc20`. History:
